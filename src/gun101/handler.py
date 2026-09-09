@@ -111,8 +111,7 @@ def decrypt_file(container_data: bytes, password: str, keyfile_path: str = None)
 
     Args:
         container_data: The encrypted container (JSON bytes).
-        password: The user password (must be at least 10 characters with uppercase,
-        lowercase, digit, and special character).
+        password: The user password.
         keyfile_path: Optional path to keyfile (required if container indicates keyfile_required).
 
     Returns:
@@ -121,9 +120,6 @@ def decrypt_file(container_data: bytes, password: str, keyfile_path: str = None)
     Raises:
         ValueError: For any error (malformed container, wrong password, missing/wrong keyfile, etc.).
     """
-    # Validate password
-    validate_password(password)
-
     # Step 1: Parse JSON
     if not isinstance(container_data, bytes):
         raise ValueError("Decryption failed")

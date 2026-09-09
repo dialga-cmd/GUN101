@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: MIT
 
 """Coverage for the validation branches of the crypto modules."""
+import base64
+import json
+import os
+
 import pytest
 
 from gun101 import cipher, config, handler, kdf
@@ -75,13 +79,12 @@ class TestHandlerValidation:
 
     def test_decrypt_file_rejects_altered_salt_length(self):
         data = b"payload"
-        password = "Str0ngP@ssw0rd!"
-        import base64
+        password = "P" * 4 + "a" * 4 + "1" * 4 + "!"
 
         container = handler.encrypt_file(data, password)
-        parsed = __import__("json").loads(container.decode())
+        parsed = json.loads(container.decode())
         parsed["salt"] = base64.b64encode(b"short").decode()
-        tampered = __import__("json").dumps(parsed).encode()
+        tampered = json.dumps(parsed).encode()
         with pytest.raises(ValueError, match="Salt must be"):
             handler.decrypt_file(tampered, password)
 
@@ -90,3 +93,89 @@ class TestHandlerValidation:
         assert len(SALT) == config.ARGON2_SALT_LEN
         assert len(KEY) == config.AES_KEY_LEN
         assert len(NONCE) == config.AES_NONCE_LEN
+
+
+class TestDecryptPasswordPolicyRegression:
+    """Regression tests for GitHub Issue #4:
+    decrypt should NOT enforce the password policy and should allow containers
+    created with older/shorter passwords to be decrypted.
+    """
+
+    def test_decrypt_container_with_older_shorter_password(self, monkeypatch):
+        """A container created using an older/shorter password policy can still be decrypted."""
+        data = b"secret legacy message"
+        short_password = "short"
+
+        # Simulate creation of a container under an older/shorter password policy
+        monkeypatch.setattr(handler, "validate_password", lambda p: None)
+        container = handler.encrypt_file(data, short_password)
+        monkeypatch.undo()
+
+        # Decryption does not validate password policy, successfully decrypts
+        decrypted = handler.decrypt_file(container, short_password)
+        assert decrypted == data
+
+    def test_decrypt_v20_container_with_legacy_password(self):
+        """A legacy v2.0 container created with a shorter password decrypts cleanly."""
+        data = b"v2.0 legacy payload"
+        legacy_password = "oldpwd"
+        salt = os.urandom(config.ARGON2_SALT_LEN)
+        nonce = os.urandom(config.AES_NONCE_LEN)
+        key = kdf.derive_key(legacy_password, salt)
+        ciphertext, tag = cipher.encrypt(data, key, nonce, None)
+
+        container_dict = {
+            "protocol": config.PROTOCOL,
+            "version": "2.0",
+            "keyfile_required": False,
+            "keyfile_fingerprint": None,
+            "salt": base64.b64encode(salt).decode("utf-8"),
+            "nonce": base64.b64encode(nonce).decode("utf-8"),
+            "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
+            "tag": base64.b64encode(tag).decode("utf-8"),
+        }
+        container = json.dumps(container_dict).encode("utf-8")
+        decrypted = handler.decrypt_file(container, legacy_password)
+        assert decrypted == data
+
+    def test_decrypt_current_policy_password_succeeds(self):
+        """A normal current-policy encrypted container still decrypts successfully."""
+        data = b"modern payload"
+        password = "P" * 4 + "a" * 4 + "1" * 4 + "!"
+        container = handler.encrypt_file(data, password)
+        decrypted = handler.decrypt_file(container, password)
+        assert decrypted == data
+
+    def test_decrypt_incorrect_password_fails_generic_error(self):
+        """An incorrect password still fails with the existing generic 'Decryption failed' error."""
+        data = b"confidential payload"
+        password = "P" * 4 + "a" * 4 + "1" * 4 + "!"
+        container = handler.encrypt_file(data, password)
+
+        # Wrong strong password fails with generic "Decryption failed"
+        with pytest.raises(ValueError, match="^Decryption failed$"):
+            handler.decrypt_file(container, "W" * 4 + "o" * 4 + "2" * 4 + "@")
+
+        # Wrong short password (violating policy) must also fail with generic "Decryption failed",
+        # NOT a password policy ValueError
+        with pytest.raises(ValueError, match="^Decryption failed$"):
+            handler.decrypt_file(container, "wrong")
+
+    def test_encrypt_still_rejects_policy_violating_passwords(self):
+        """Encryption still enforces the current password policy."""
+        data = b"payload"
+        # Too short
+        with pytest.raises(ValueError, match="Password must be at least 10 characters long"):
+            handler.encrypt_file(data, "Sh0rt!")
+        # Missing uppercase
+        with pytest.raises(ValueError, match="Password must contain at least one uppercase letter"):
+            handler.encrypt_file(data, "lowercasewithdigit1!")
+        # Missing lowercase
+        with pytest.raises(ValueError, match="Password must contain at least one lowercase letter"):
+            handler.encrypt_file(data, "UPPERCASEWITHDIGIT1!")
+        # Missing digit
+        with pytest.raises(ValueError, match="Password must contain at least one digit"):
+            handler.encrypt_file(data, "NoDigitsHereEver!")
+        # Missing special char
+        with pytest.raises(ValueError, match="Password must contain at least one special character"):
+            handler.encrypt_file(data, "NoSpecialChar1234")
