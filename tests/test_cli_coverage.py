@@ -413,12 +413,24 @@ class TestSafeOpenWritePathContainment:
         assert any("portable_kf.bin" in p for p in normcase_recorded)
 
     def test_safe_open_write_mixed_case_path_native(self, workdir):
-        """Native filesystem test on Windows/macOS where the OS filesystem is case-insensitive."""
-        if sys.platform not in ("win32", "darwin"):
-            pytest.skip("Case-insensitive filesystem test on Windows/macOS")
+        """Native filesystem test on filesystems that are case-insensitive."""
+        # Detect whether the actual filesystem at the temporary test location is case-insensitive
+        probe = workdir / "case_sensitivity_probe.tmp"
+        probe.write_text("probe")
+        is_case_insensitive = (workdir / "CASE_SENSITIVITY_PROBE.TMP").exists()
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+
+        if not is_case_insensitive:
+            pytest.skip("Filesystem at test location is case-sensitive")
 
         real_cwd = os.path.realpath(os.getcwd())
         alt_cwd = "".join(c.lower() if c.isupper() else c.upper() for c in real_cwd)
+
+        if not os.path.exists(alt_cwd):
+            pytest.skip("Working directory path is not accessible with alternated case")
 
         cli_alt_path = os.path.join(alt_cwd, "alt_case_cli.bin")
         with cli.safe_open_write(cli_alt_path) as f:
@@ -460,3 +472,69 @@ class TestSafeOpenWritePathContainment:
             cli.safe_open_write(other_drive_path)
         with pytest.raises(ValueError, match="escape"):
             keyfile.safe_open_write(other_drive_path)
+
+    def test_is_case_insensitive_fs_detection_and_fallback(self, workdir, monkeypatch):
+        """Verify _is_case_insensitive_fs behavior across Windows, POSIX detection, and fallback."""
+        # 1. On Windows, returns True
+        monkeypatch.setattr(os, "name", "nt")
+        assert cli._is_case_insensitive_fs(str(workdir)) is True
+        assert keyfile._is_case_insensitive_fs(str(workdir)) is True
+
+        # 2. On POSIX with successful case alternation
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(os.path, "samefile", lambda a, b: True)
+        monkeypatch.setattr(os.path, "exists", lambda p: True)
+        assert cli._is_case_insensitive_fs(str(workdir)) is True
+        assert keyfile._is_case_insensitive_fs(str(workdir)) is True
+
+        # 3. On POSIX fallback when case alternation does not match (case-sensitive)
+        monkeypatch.setattr(os.path, "samefile", lambda a, b: False)
+        assert cli._is_case_insensitive_fs(str(workdir)) is False
+        assert keyfile._is_case_insensitive_fs(str(workdir)) is False
+
+        # 4. Fail-closed on OSError
+        def raise_oserror(a, b):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(os.path, "samefile", raise_oserror)
+        assert cli._is_case_insensitive_fs(str(workdir)) is False
+        assert keyfile._is_case_insensitive_fs(str(workdir)) is False
+
+    def test_safe_open_write_case_sensitive_fallback_rejects_mixed_case(self, workdir, monkeypatch):
+        """When filesystem is case-sensitive, paths differing in case must be rejected as escape attempts."""
+        monkeypatch.setattr(cli, "_is_case_insensitive_fs", lambda _: False)
+        monkeypatch.setattr(keyfile, "_is_case_insensitive_fs", lambda _: False)
+        # On Windows, ntpath.normcase lowercases and realpath canonicalizes case; simulate POSIX case divergence
+        monkeypatch.setattr(os.path, "normcase", lambda p: os.fspath(p))
+
+        real_cwd = os.path.realpath(os.getcwd())
+        alt_cwd = "".join(c.lower() if c.isupper() else c.upper() for c in real_cwd)
+        if alt_cwd == real_cwd:
+            pytest.skip("cwd has no letters to alternate case")
+
+        orig_realpath = os.path.realpath
+
+        def mock_realpath(p):
+            if os.path.basename(p) in ("cs_cli.bin", "cs_kf.bin"):
+                return os.path.join(alt_cwd, os.path.basename(p))
+            return orig_realpath(p)
+
+        monkeypatch.setattr(os.path, "realpath", mock_realpath)
+
+        cli_alt_path = os.path.join(alt_cwd, "cs_cli.bin")
+        with pytest.raises(ValueError, match="escape"):
+            cli.safe_open_write(cli_alt_path)
+
+        kf_alt_path = os.path.join(alt_cwd, "cs_kf.bin")
+        with pytest.raises(ValueError, match="escape"):
+            keyfile.safe_open_write(kf_alt_path)
+
+    def test_safe_open_write_case_insensitive_escape_rejected(self, workdir, monkeypatch):
+        """On case-insensitive filesystems, paths outside cwd must still be strictly rejected."""
+        monkeypatch.setattr(cli, "_is_case_insensitive_fs", lambda _: True)
+        monkeypatch.setattr(keyfile, "_is_case_insensitive_fs", lambda _: True)
+
+        with pytest.raises(ValueError, match="escape"):
+            cli.safe_open_write("../OUTSIDE.BIN")
+        with pytest.raises(ValueError, match="escape"):
+            keyfile.safe_open_write("../OUTSIDE_KF.BIN")

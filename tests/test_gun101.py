@@ -400,6 +400,7 @@ class TestKeyfile:
                 data = f.read()
             assert len(data) == config.KEYFILE_LEN
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file permission bits are not enforced on Windows")
     def test_generate_keyfile_sets_permissions_to_0o600(self):
         """Generated keyfile should have permissions 0o600."""
         with tempfile.TemporaryDirectory() as tmpdir:
