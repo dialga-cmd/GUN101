@@ -25,7 +25,7 @@ def validate_password(password: str) -> None:
     if not isinstance(password, str):
         raise ValueError("Password must be a string")
     if len(password) < config.PASSWORD_MIN_LENGTH:
-        raise ValueError("Password must be at least 10 characters long")
+        raise ValueError(f"Password must be at least {config.PASSWORD_MIN_LENGTH} characters long")
     if config.PASSWORD_REQUIRE_UPPERCASE and not any(c.isupper() for c in password):
         raise ValueError("Password must contain at least one uppercase letter")
     if config.PASSWORD_REQUIRE_LOWERCASE and not any(c.islower() for c in password):
