@@ -224,4 +224,4 @@ The `gun101` Python package exposes both in-memory and streaming operations prog
 - `gun101.keyfile.generate_keyfile(path: str) -> None`
   — create a keyfile at `path`.
 - `gun101.keyfile.keyfile_fingerprint(keyfile_bytes: bytes) -> str`
-  — return the SHA-256 fingerprint of keyfile bytes.
+  — return the SHA-256 fingerprint of keyfile bytes.
