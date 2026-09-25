@@ -30,22 +30,19 @@ def _is_case_insensitive_fs(path: str) -> bool:
     return False
 
 
-def safe_open_write(path):
-    """Open a file for writing in binary mode, after checking for symlinks and path safety.
-    Raises ValueError if the path is unsafe.
+def validate_safe_path(path) -> None:
+    """Validate a path for safe output creation.
+
+    Raises ValueError if the path is a symlink or escapes the current working directory.
     """
-    # Check for symlink on the given path (before resolving)
     if os.path.islink(path):
         raise ValueError("Output path is a symlink; refusing to write")
 
-    # Get the real path (resolving symlinks)
     real_path = os.path.realpath(path)
     real_cwd = os.path.realpath(os.getcwd())
     norm_path = os.path.normcase(real_path)
     norm_cwd = os.path.normcase(real_cwd)
 
-    # If the underlying filesystem is case-insensitive (e.g. Windows NTFS, or default APFS
-    # on macOS where posixpath.normcase() is a no-op), fold case before commonpath containment check.
     if _is_case_insensitive_fs(real_cwd):
         norm_path = norm_path.lower()
         norm_cwd = norm_cwd.lower()
@@ -55,9 +52,13 @@ def safe_open_write(path):
     except ValueError:
         raise ValueError("Output path attempts to escape the intended directory") from None
 
-    # Ensure the real path is within the real cwd
     if common_path != norm_cwd:
         raise ValueError("Output path attempts to escape the intended directory")
 
-    # Open the file for writing in binary mode
+
+def safe_open_write(path):
+    """Open a file for writing in binary mode after validating its path.
+    Raises ValueError if the path is unsafe.
+    """
+    validate_safe_path(path)
     return open(path, 'wb')

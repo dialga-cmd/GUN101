@@ -9,7 +9,7 @@ import os
 import sys
 
 from . import config, handler, keyfile
-from ._util import safe_open_write
+from ._util import safe_open_write, validate_safe_path
 
 
 def get_password():
@@ -31,25 +31,49 @@ def get_password():
 def encrypt(args):
     """Handle the encrypt subcommand."""
     try:
-        with open(args.file, 'rb') as f:
-            data = f.read()
+        in_f = open(args.file, 'rb')
     except OSError as e:
         print(f"Error reading file: {e}", file=sys.stderr)
         sys.exit(1)
 
+    password = get_password()
     try:
-        password = get_password()
-        container = handler.encrypt_file(data, password, args.keyfile)
+        handler.validate_password(password)
+        if args.keyfile is not None:
+            keyfile.load_keyfile(args.keyfile)
     except ValueError as e:
+        in_f.close()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        in_f.close()
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     output_path = args.output if args.output else (args.file + '.gun101')
     try:
-        with safe_open_write(output_path) as f:
-            f.write(container)
+        out_f = safe_open_write(output_path)
     except (OSError, ValueError) as e:
+        in_f.close()
         print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with in_f, out_f:
+            handler.encrypt_stream(in_f, out_f, password, args.keyfile)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
         sys.exit(1)
 
     print(f"Encrypted file written to: {output_path}")
@@ -57,18 +81,12 @@ def encrypt(args):
 def decrypt(args):
     """Handle the decrypt subcommand."""
     try:
-        with open(args.file, 'rb') as f:
-            container = f.read()
+        in_f = open(args.file, 'rb')
     except OSError as e:
         print(f"Error reading file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        password = get_password()
-        data = handler.decrypt_file(container, password, args.keyfile)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    password = get_password()
 
     output_path = args.output
     if output_path is None:
@@ -79,9 +97,41 @@ def decrypt(args):
             output_path = args.file + '.decrypted'
 
     try:
-        with safe_open_write(output_path) as f:
-            f.write(data)
+        validate_safe_path(output_path)
     except (OSError, ValueError) as e:
+        in_f.close()
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Stream to a temporary staging file in the target directory to prevent
+    # release of unverified plaintext and ensure atomic replacement.
+    temp_dir = os.path.dirname(os.path.abspath(output_path))
+    temp_path = os.path.join(temp_dir, f".{os.path.basename(output_path)}.tmp.{os.urandom(8).hex()}")
+    try:
+        temp_f = open(temp_path, 'wb')
+    except OSError as e:
+        in_f.close()
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with in_f, temp_f:
+            handler.decrypt_stream(in_f, temp_f, password, args.keyfile)
+        os.replace(temp_path, output_path)
+    except ValueError as e:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except (OSError, Exception) as e:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
 
