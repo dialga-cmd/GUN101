@@ -51,9 +51,12 @@ def _is_case_insensitive_fs(path: str) -> bool:
     return False
 
 
-def safe_open_write(path):
+def safe_open_write(path, force=False):
     """Open a file for writing in binary mode, after checking for symlinks and path safety.
+    If force is False, opens with exclusive creation mode ('xb') to prevent overwriting existing files.
+    If force is True, opens with 'wb' mode, allowing overwrite.
     Raises ValueError if the path is unsafe.
+    Raises FileExistsError if force is False and the destination file already exists.
     """
     # Check for symlink on the given path (before resolving)
     if os.path.islink(path):
@@ -81,7 +84,10 @@ def safe_open_write(path):
         raise ValueError("Output path attempts to escape the intended directory")
 
     # Open the file for writing in binary mode
-    return open(path, 'wb')
+    try:
+        return open(path, 'wb' if force else 'xb')
+    except FileExistsError:
+        raise FileExistsError(f"Output file already exists: {path}. Use --force to overwrite.") from None
 
 def encrypt(args):
     """Handle the encrypt subcommand."""
@@ -100,9 +106,13 @@ def encrypt(args):
         sys.exit(1)
 
     output_path = args.output if args.output else (args.file + '.gun101')
+    force = getattr(args, 'force', False)
     try:
-        with safe_open_write(output_path) as f:
+        with safe_open_write(output_path, force=force) as f:
             f.write(container)
+    except FileExistsError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except (OSError, ValueError) as e:
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
@@ -133,9 +143,13 @@ def decrypt(args):
         else:
             output_path = args.file + '.decrypted'
 
+    force = getattr(args, 'force', False)
     try:
-        with safe_open_write(output_path) as f:
+        with safe_open_write(output_path, force=force) as f:
             f.write(data)
+    except FileExistsError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except (OSError, ValueError) as e:
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
@@ -228,6 +242,7 @@ def main():
     encrypt_parser.add_argument('file', help='File to encrypt')
     encrypt_parser.add_argument('--keyfile', help='Path to keyfile for two-factor protection')
     encrypt_parser.add_argument('--output', help='Output file path (default: input.gun101)')
+    encrypt_parser.add_argument('-f', '--force', action='store_true', help='Overwrite output file if it already exists')
     # Removed --password argument
     encrypt_parser.set_defaults(func=encrypt)
 
@@ -236,6 +251,7 @@ def main():
     decrypt_parser.add_argument('file', help='File to decrypt')
     decrypt_parser.add_argument('--keyfile', help='Path to keyfile for two-factor protection')
     decrypt_parser.add_argument('--output', help='Output file path (default: strip .gun101 or add .decrypted)')
+    decrypt_parser.add_argument('-f', '--force', action='store_true', help='Overwrite output file if it already exists')
     # Removed --password argument
     decrypt_parser.set_defaults(func=decrypt)
 

@@ -126,6 +126,7 @@ class TestDecryptInProcess:
 
     def test_decrypt_default_extension(self, workdir, env_password):
         enc = self._encrypt()
+        os.remove("todo.txt")
         out, _, exc = run(cli.decrypt, make_arg(file=enc, keyfile=None, output=None))
         assert exc is None
         assert "todo.txt" in out

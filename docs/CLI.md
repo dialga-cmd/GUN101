@@ -8,8 +8,8 @@ encrypted container format).
 ## Synopsis
 
 ```
-gun101 encrypt <file> [--keyfile <path>] [--output <path>]
-gun101 decrypt <file> [--keyfile <path>] [--output <path>]
+gun101 encrypt <file> [--keyfile <path>] [--output <path>] [-f|--force]
+gun101 decrypt <file> [--keyfile <path>] [--output <path>] [-f|--force]
 gun101 generate-keyfile <path>
 gun101 keyfile-fingerprint <path>
 gun101 info
@@ -53,7 +53,7 @@ the two commands cannot diverge.
 
 ## Commands
 
-### `gun101 encrypt <file> [--keyfile <path>] [--output <path>]`
+### `gun101 encrypt <file> [--keyfile <path>] [--output <path>] [-f|--force]`
 
 **Inputs**
 
@@ -62,6 +62,7 @@ the two commands cannot diverge.
   provided, the derived key depends on both the password and the keyfile bytes.
 - `--output` (optional): path to write the encrypted container. Defaults to
   `<file>.gun101`.
+- `-f`, `--force` (optional): overwrite output file if it already exists.
 
 **Outputs**
 
@@ -73,9 +74,10 @@ the two commands cannot diverge.
 - Cannot read `file` → `Error reading file: ...` on stderr, exit `1`.
 - Weak password or invalid keyfile → `Error: ...` on stderr, exit `1`.
 - Output path is a symlink or escapes the working directory → refused, exit `1`.
+- Output path already exists and `--force` is not specified → refused, exit `1`.
 - Cannot write output → `Error writing output file: ...` on stderr, exit `1`.
 
-### `gun101 decrypt <file> [--keyfile <path>] [--output <path>]`
+### `gun101 decrypt <file> [--keyfile <path>] [--output <path>] [-f|--force]`
 
 **Inputs**
 
@@ -85,6 +87,7 @@ the two commands cannot diverge.
 - `--output` (optional): path to write the plaintext. Defaults to stripping the
   `.gun101` suffix, or appending `.decrypted` if the input does not end in
   `.gun101`.
+- `-f`, `--force` (optional): overwrite output file if it already exists.
 
 **Outputs**
 
@@ -100,6 +103,7 @@ the two commands cannot diverge.
   GCM tag verification all produce this same message.
 - Cannot read `file` → `Error reading file: ...` on stderr, exit `1`.
 - Output path is a symlink or escapes the working directory → refused, exit `1`.
+- Output path already exists and `--force` is not specified → refused, exit `1`.
 
 ### `gun101 generate-keyfile <path>`
 
