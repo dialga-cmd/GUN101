@@ -12,11 +12,12 @@ import argparse
 import contextlib
 import io
 import os
+import subprocess
 import sys
 
 import pytest
 
-from gun101 import cli, keyfile
+from gun101 import _util, cli, keyfile
 
 STRONG_PASSWORD = "Str0ngP@ssw0rd!"
 
@@ -196,6 +197,19 @@ class TestGenerateKeyfileInProcess:
         assert exc is not None and exc.code == 1
         assert "escape" in err
 
+    def test_generate_windows_permission_failure(self, workdir, monkeypatch):
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: True)
+        monkeypatch.setattr(keyfile.getpass, "getuser", lambda: "testuser")
+
+        def mock_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=5, stdout="", stderr="Access denied")
+
+        monkeypatch.setattr(keyfile.subprocess, "run", mock_run)
+        _, err, exc = run(cli.generate_keyfile, make_arg(path="failed.kf"))
+        assert exc is not None and exc.code == 1
+        assert "Error creating keyfile" in err
+        assert not os.path.exists("failed.kf")
+
 
 class TestKeyfileFingerprintInProcess:
     def test_fingerprint_success(self, workdir):
@@ -349,6 +363,11 @@ class TestGetPasswordPathInProcess:
 class TestSafeOpenWritePathContainment:
     """Tests for safe_open_write path-containment and case sensitivity (Issue #10)."""
 
+    def test_safe_open_write_shared_function(self):
+        """Verify both cli and keyfile use the shared safe_open_write function from _util."""
+        assert cli.safe_open_write is _util.safe_open_write
+        assert keyfile.safe_open_write is _util.safe_open_write
+
     def test_safe_open_write_relative_path(self, workdir):
         """Relative paths within cwd should be accepted."""
         with cli.safe_open_write("relative.bin") as f:
@@ -478,33 +497,28 @@ class TestSafeOpenWritePathContainment:
         """Verify _is_case_insensitive_fs behavior across Windows, POSIX detection, and fallback."""
         # 1. On Windows, returns True
         monkeypatch.setattr(os, "name", "nt")
-        assert cli._is_case_insensitive_fs(str(workdir)) is True
-        assert keyfile._is_case_insensitive_fs(str(workdir)) is True
+        assert _util._is_case_insensitive_fs(str(workdir)) is True
 
         # 2. On POSIX with successful case alternation
         monkeypatch.setattr(os, "name", "posix")
         monkeypatch.setattr(os.path, "samefile", lambda a, b: True)
         monkeypatch.setattr(os.path, "exists", lambda p: True)
-        assert cli._is_case_insensitive_fs(str(workdir)) is True
-        assert keyfile._is_case_insensitive_fs(str(workdir)) is True
+        assert _util._is_case_insensitive_fs(str(workdir)) is True
 
         # 3. On POSIX fallback when case alternation does not match (case-sensitive)
         monkeypatch.setattr(os.path, "samefile", lambda a, b: False)
-        assert cli._is_case_insensitive_fs(str(workdir)) is False
-        assert keyfile._is_case_insensitive_fs(str(workdir)) is False
+        assert _util._is_case_insensitive_fs(str(workdir)) is False
 
         # 4. Fail-closed on OSError
         def raise_oserror(a, b):
             raise OSError("permission denied")
 
         monkeypatch.setattr(os.path, "samefile", raise_oserror)
-        assert cli._is_case_insensitive_fs(str(workdir)) is False
-        assert keyfile._is_case_insensitive_fs(str(workdir)) is False
+        assert _util._is_case_insensitive_fs(str(workdir)) is False
 
     def test_safe_open_write_case_sensitive_fallback_rejects_mixed_case(self, workdir, monkeypatch):
         """When filesystem is case-sensitive, paths differing in case must be rejected as escape attempts."""
-        monkeypatch.setattr(cli, "_is_case_insensitive_fs", lambda _: False)
-        monkeypatch.setattr(keyfile, "_is_case_insensitive_fs", lambda _: False)
+        monkeypatch.setattr(_util, "_is_case_insensitive_fs", lambda _: False)
         # On Windows, ntpath.normcase lowercases and realpath canonicalizes case; simulate POSIX case divergence
         monkeypatch.setattr(os.path, "normcase", lambda p: os.fspath(p))
 
@@ -532,8 +546,7 @@ class TestSafeOpenWritePathContainment:
 
     def test_safe_open_write_case_insensitive_escape_rejected(self, workdir, monkeypatch):
         """On case-insensitive filesystems, paths outside cwd must still be strictly rejected."""
-        monkeypatch.setattr(cli, "_is_case_insensitive_fs", lambda _: True)
-        monkeypatch.setattr(keyfile, "_is_case_insensitive_fs", lambda _: True)
+        monkeypatch.setattr(_util, "_is_case_insensitive_fs", lambda _: True)
 
         with pytest.raises(ValueError, match="escape"):
             cli.safe_open_write("../OUTSIDE.BIN")

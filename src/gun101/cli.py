@@ -9,6 +9,7 @@ import os
 import sys
 
 from . import config, handler, keyfile
+from ._util import safe_open_write, validate_safe_path
 
 
 def get_password():
@@ -26,95 +27,58 @@ def get_password():
         return password
     return getpass.getpass(prompt='Password: ')
 
-def _is_case_insensitive_fs(path: str) -> bool:
-    """Determine whether the filesystem hosting `path` is case-insensitive.
-
-    Performs a safe, read-only check: tests whether alternating the case of
-    an existing path component resolves to the exact same file/directory on disk
-    via os.path.exists() and os.path.samefile().
-    """
-    if os.name == "nt":
-        return True
-    try:
-        cur = path
-        while cur and cur != os.path.dirname(cur):
-            base = os.path.basename(cur)
-            parent = os.path.dirname(cur)
-            for i, ch in enumerate(base):
-                if ch.isalpha():
-                    alt_base = base[:i] + (ch.lower() if ch.isupper() else ch.upper()) + base[i + 1:]
-                    alt_path = os.path.join(parent, alt_base)
-                    return os.path.exists(alt_path) and os.path.samefile(cur, alt_path)
-            cur = parent
-    except OSError:
-        pass
-    return False
-
-
-def safe_open_write(path, force=False):
-    """Open a file for writing in binary mode, after checking for symlinks and path safety.
-    If force is False, opens with exclusive creation mode ('xb') to prevent overwriting existing files.
-    If force is True, opens with 'wb' mode, allowing overwrite.
-    Raises ValueError if the path is unsafe.
-    Raises FileExistsError if force is False and the destination file already exists.
-    """
-    # Check for symlink on the given path (before resolving)
-    if os.path.islink(path):
-        raise ValueError("Output path is a symlink; refusing to write")
-
-    # Get the real path (resolving symlinks)
-    real_path = os.path.realpath(path)
-    real_cwd = os.path.realpath(os.getcwd())
-    norm_path = os.path.normcase(real_path)
-    norm_cwd = os.path.normcase(real_cwd)
-
-    # If the underlying filesystem is case-insensitive (e.g. Windows NTFS, or default APFS
-    # on macOS where posixpath.normcase() is a no-op), fold case before commonpath containment check.
-    if _is_case_insensitive_fs(real_cwd):
-        norm_path = norm_path.lower()
-        norm_cwd = norm_cwd.lower()
-
-    try:
-        common_path = os.path.commonpath([norm_path, norm_cwd])
-    except ValueError:
-        raise ValueError("Output path attempts to escape the intended directory") from None
-
-    # Ensure the real path is within the real cwd
-    if common_path != norm_cwd:
-        raise ValueError("Output path attempts to escape the intended directory")
-
-    # Open the file for writing in binary mode
-    try:
-        return open(path, 'wb' if force else 'xb')
-    except FileExistsError:
-        raise FileExistsError(f"Output file already exists: {path}. Use --force to overwrite.") from None
 
 def encrypt(args):
     """Handle the encrypt subcommand."""
     try:
-        with open(args.file, 'rb') as f:
-            data = f.read()
+        in_f = open(args.file, 'rb')
     except OSError as e:
         print(f"Error reading file: {e}", file=sys.stderr)
         sys.exit(1)
 
+    password = get_password()
     try:
-        password = get_password()
-        container = handler.encrypt_file(data, password, args.keyfile)
+        handler.validate_password(password)
+        if args.keyfile is not None:
+            keyfile.load_keyfile(args.keyfile)
     except ValueError as e:
+        in_f.close()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as e:
+        in_f.close()
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     output_path = args.output if args.output else (args.file + '.gun101')
     force = getattr(args, 'force', False)
     try:
-        with safe_open_write(output_path, force=force) as f:
-            f.write(container)
+        out_f = safe_open_write(output_path, force=force)
     except FileExistsError as e:
+        in_f.close()
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     except (OSError, ValueError) as e:
+        in_f.close()
         print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with in_f, out_f:
+            handler.encrypt_stream(in_f, out_f, password, args.keyfile)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
+        sys.exit(1)
+    except OSError as e:
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
         sys.exit(1)
 
     print(f"Encrypted file written to: {output_path}")
@@ -122,18 +86,12 @@ def encrypt(args):
 def decrypt(args):
     """Handle the decrypt subcommand."""
     try:
-        with open(args.file, 'rb') as f:
-            container = f.read()
+        in_f = open(args.file, 'rb')
     except OSError as e:
         print(f"Error reading file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    try:
-        password = get_password()
-        data = handler.decrypt_file(container, password, args.keyfile)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    password = get_password()
 
     output_path = args.output
     if output_path is None:
@@ -145,12 +103,64 @@ def decrypt(args):
 
     force = getattr(args, 'force', False)
     try:
-        with safe_open_write(output_path, force=force) as f:
-            f.write(data)
+        validate_safe_path(output_path)
+    except (OSError, ValueError) as e:
+        in_f.close()
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Stream to a temporary staging file in the target directory to prevent
+    # release of unverified plaintext and ensure atomic replacement.
+    temp_dir = os.path.dirname(os.path.abspath(output_path))
+    temp_path = os.path.join(temp_dir, f".{os.path.basename(output_path)}.tmp.{os.urandom(8).hex()}")
+    try:
+        temp_f = open(temp_path, 'wb')
+    except OSError as e:
+        in_f.close()
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    output_reserved = False
+    try:
+        with in_f, temp_f:
+            handler.decrypt_stream(in_f, temp_f, password, args.keyfile)
+        if not force:
+            with safe_open_write(output_path):
+                pass
+            output_reserved = True
+        os.replace(temp_path, output_path)
     except FileExistsError as e:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+        if output_reserved:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-    except (OSError, ValueError) as e:
+    except ValueError as e:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except (OSError, Exception) as e:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+        if output_reserved:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
 

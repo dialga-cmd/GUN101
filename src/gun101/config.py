@@ -25,6 +25,7 @@ ARGON2_SALT_LEN = 32
 AES_NONCE_LEN = 12
 AES_KEY_LEN = 32
 KEYFILE_LEN = 32
+DEFAULT_CHUNK_SIZE = 64 * 1024
 
 # Password policy (enforced during encryption, displayed by `info`).
 PASSWORD_MIN_LENGTH = 10
