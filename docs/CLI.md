@@ -68,6 +68,10 @@ the two commands cannot diverge.
 - Writes the encrypted container to `--output` (or `<file>.gun101`).
 - Prints `Encrypted file written to: <path>` to standard output.
 
+**Memory behavior**
+
+- Operates in a bounded-memory streaming mode: input is read and encrypted in fixed chunks (64 KB). The complete file, ciphertext, and Base64 representations are never held in memory simultaneously.
+
 **Failure modes**
 
 - Cannot read `file` → `Error reading file: ...` on stderr, exit `1`.
@@ -90,6 +94,11 @@ the two commands cannot diverge.
 
 - Writes the decrypted plaintext to `--output` (or the default derived path).
 - Prints `Decrypted file written to: <path>` to standard output.
+
+**Memory behavior**
+
+- Operates in bounded-memory streaming mode: the container is parsed incrementally and decrypted in fixed chunks.
+- To prevent Release of Unverified Plaintext (RUP), decrypted chunks are staged to a temporary file in the target directory and atomically moved into place via `os.replace` only after the AES-GCM authentication tag is successfully verified in constant time. If authentication fails, the temporary file is unlinked and no output file is created.
 
 **Failure modes**
 
@@ -184,18 +193,35 @@ any header tampering invalidates the authentication tag. For `version: "2.0"`,
 the ciphertext was encrypted without associated data; this format is supported
 for backward compatibility only.
 
+## Memory Footprint & Large-File Streaming
+
+GUN-101 uses a bounded-memory streaming architecture for CLI file encryption and decryption:
+
+- **Fixed-size chunk processing**: Files are processed in fixed chunks (default 64 KB, configured by `config.DEFAULT_CHUNK_SIZE`). Plaintext is encrypted incrementally into Base64 ciphertext, and ciphertext is parsed and decrypted incrementally back to plaintext.
+- **Bounded RAM consumption**: The complete input file, full ciphertext, and full Base64 representation are never loaded into memory. Memory usage remains constant and small ($O(1)$) regardless of whether processing small files or multi-gigabyte archives.
+- **Preserved container format**: The on-disk `.gun101` v2.1 container format is fully preserved and identical. Streaming encrypted containers can be decrypted by non-streaming readers, and non-streaming containers can be decrypted by streaming readers.
+- **Integrity protection**: AES-256-GCM authenticated encryption and constant-time tag verification are strictly preserved. To avoid Release of Unverified Plaintext (RUP), decrypted plaintext is written to a temporary staging file in the target directory and atomically moved into place only after the GCM tag is fully validated.
+
 ## Library Interface
 
-The `gun101` Python package exposes the same operations programmatically:
+The `gun101` Python package exposes both in-memory and streaming operations programmatically:
 
+- `gun101.handler.encrypt_stream(in_stream, out_stream, password: str, keyfile_path: str = None, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None`
+  — stream plaintext from `in_stream` and write encrypted container to `out_stream` using bounded memory.
+- `gun101.handler.decrypt_stream(in_stream, out_stream, password: str, keyfile_path: str = None, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None`
+  — stream encrypted container from `in_stream` and write decrypted plaintext to `out_stream` using bounded memory. Raises `ValueError("Decryption failed")` on error.
+- `gun101.cipher.StreamEncryptor(key: bytes, nonce: bytes, associated_data: bytes = None)`
+  — incremental AES-256-GCM encryptor with `update(chunk)` and `finalize() -> tuple[bytes, bytes]`.
+- `gun101.cipher.StreamDecryptor(key: bytes, nonce: bytes, tag: bytes = None, associated_data: bytes = None)`
+  — incremental AES-256-GCM decryptor with `update(chunk)` and `finalize(tag=None) -> bytes`.
 - `gun101.handler.encrypt_file(file_data: bytes, password: str, keyfile_path: str = None) -> bytes`
-  — encrypt and return the container bytes.
+  — in-memory helper to encrypt and return container bytes.
 - `gun101.handler.decrypt_file(container_data: bytes, password: str, keyfile_path: str = None) -> bytes`
-  — decrypt and return the plaintext bytes. Raises `ValueError("Decryption failed")`
+  — in-memory helper to decrypt and return plaintext bytes. Raises `ValueError("Decryption failed")`
   for any failure.
 - `gun101.handler.validate_password(password: str) -> None`
   — validate the password policy; raises `ValueError` on failure.
 - `gun101.keyfile.generate_keyfile(path: str) -> None`
   — create a keyfile at `path`.
 - `gun101.keyfile.keyfile_fingerprint(keyfile_bytes: bytes) -> str`
-  — return the SHA-256 fingerprint of keyfile bytes.
+  — return the SHA-256 fingerprint of keyfile bytes.
