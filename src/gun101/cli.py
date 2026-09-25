@@ -3,9 +3,11 @@
 
 """Command-line interface for GUN-101."""
 import argparse
+import errno
 import getpass
 import importlib.metadata
 import os
+import stat
 import sys
 
 from . import config, handler, keyfile
@@ -52,14 +54,39 @@ def _is_case_insensitive_fs(path: str) -> bool:
 
 
 def safe_open_write(path):
-    """Open a file for writing in binary mode, after checking for symlinks and path safety.
-    Raises ValueError if the path is unsafe.
+    """Open a file for writing in binary mode, protecting against path traversal and symlink races.
+
+    On POSIX systems, this uses os.open() with O_CREAT | O_EXCL and O_NOFOLLOW to atomically
+    prevent following symlinks on creation. When overwriting an existing regular file,
+    O_NOFOLLOW is used in combination with pre-open lstat() and post-open fstat() identity
+    checks (comparing device and inode numbers) to prevent symlink redirection and non-regular
+    file access (e.g. FIFOs, devices).
+
+    On platforms where O_NOFOLLOW is unavailable (such as Windows), atomic symlink-rejection
+    during open() is not natively supported by the operating system flags. In this case,
+    the implementation uses a safe fallback: it performs preliminary symlink checks, verifies
+    regular file status via pre-open lstat(), and validates file identity post-open via fstat()
+    and re-checked lstat(). Residual limitation on platforms without O_NOFOLLOW: while post-open
+    checks verify the file identity and close the handle if a swap occurs, a narrow race window
+    theoretically exists between pre-open lstat() and os.open() where a target could be opened
+    prior to verification.
+
+    Args:
+        path: Target file path to write to.
+
+    Returns:
+        A binary file object opened for writing (mode 'wb').
+
+    Raises:
+        ValueError: If the output path is a symlink, escapes the intended directory,
+                    resolves to a non-regular file, or changes identity during opening.
+        OSError: If an operating system error occurs during file opening.
     """
-    # Check for symlink on the given path (before resolving)
+    # Preliminary symlink check
     if os.path.islink(path):
         raise ValueError("Output path is a symlink; refusing to write")
 
-    # Get the real path (resolving symlinks)
+    # Path containment check
     real_path = os.path.realpath(path)
     real_cwd = os.path.realpath(os.getcwd())
     norm_path = os.path.normcase(real_path)
@@ -80,8 +107,96 @@ def safe_open_write(path):
     if common_path != norm_cwd:
         raise ValueError("Output path attempts to escape the intended directory")
 
-    # Open the file for writing in binary mode
-    return open(path, 'wb')
+    binary_flag = getattr(os, "O_BINARY", 0)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+    has_nofollow = hasattr(os, "O_NOFOLLOW")
+
+    # Attempt atomic creation or safe overwrite across a bounded retry loop (to guard against
+    # concurrent deletion/replacement between exclusive creation and overwrite attempts).
+    for _ in range(5):
+        try:
+            # 1. Attempt exclusive creation first with secure permissions (0o600).
+            # If the path does not exist, O_CREAT | O_EXCL atomically creates it without following symlinks.
+            create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | binary_flag | nofollow_flag
+            fd = os.open(path, create_flags, 0o600)
+            break
+        except OSError as e:
+            if e.errno in (errno.ELOOP, getattr(errno, "EMLINK", None)) or os.path.islink(path):
+                raise ValueError("Output path is a symlink; refusing to write") from None
+            if e.errno == errno.EEXIST:
+                # 2. File already exists: handle safe overwrite.
+                try:
+                    lst = os.lstat(path)
+                except OSError as lst_err:
+                    if lst_err.errno == errno.ENOENT:
+                        continue  # File was unlinked between open and lstat; retry creation
+                    raise
+
+                if stat.S_ISLNK(lst.st_mode) or os.path.islink(path):
+                    raise ValueError("Output path is a symlink; refusing to write") from None
+                if not stat.S_ISREG(lst.st_mode):
+                    raise ValueError("Output path is not a regular file; refusing to write") from None
+
+                # Open existing file for truncation with O_NOFOLLOW (on platforms supporting it).
+                trunc_flags = os.O_WRONLY | os.O_TRUNC | binary_flag | nofollow_flag
+                try:
+                    fd = os.open(path, trunc_flags, 0o600)
+                except OSError as open_err:
+                    if open_err.errno in (errno.ELOOP, getattr(errno, "EMLINK", None)) or os.path.islink(path):
+                        raise ValueError("Output path is a symlink; refusing to write") from None
+                    if open_err.errno == errno.ENOENT:
+                        continue  # File unlinked between lstat and open; retry creation
+                    raise
+
+                # Verify opened fd properties against prior lstat
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode):
+                        raise ValueError("Output path is not a regular file; refusing to write")
+                    if os.path.islink(path):
+                        raise ValueError("Output path is a symlink; refusing to write")
+
+                    # Verify that opened file matches prior lstat (guards against swap between lstat and open)
+                    if lst.st_ino != 0 and st.st_ino != 0 and (lst.st_ino != st.st_ino or lst.st_dev != st.st_dev):
+                        raise ValueError("Output path is a symlink; refusing to write")
+
+                    if not has_nofollow:
+                        lst2 = os.lstat(path)
+                        if stat.S_ISLNK(lst2.st_mode) or os.path.islink(path):
+                            raise ValueError("Output path is a symlink; refusing to write")
+                        if (
+                            lst2.st_ino != 0
+                            and st.st_ino != 0
+                            and (lst2.st_ino != st.st_ino or lst2.st_dev != st.st_dev)
+                        ):
+                            raise ValueError("Output path is a symlink; refusing to write")
+
+                    return os.fdopen(fd, "wb")
+                except Exception:
+                    os.close(fd)
+                    raise
+            else:
+                raise
+    else:
+        raise OSError("Unable to safely open file after repeated attempts")
+
+    # If opened via atomic exclusive creation:
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError("Output path is not a regular file; refusing to write")
+        if not has_nofollow:
+            if os.path.islink(path):
+                raise ValueError("Output path is a symlink; refusing to write")
+            lst = os.lstat(path)
+            if stat.S_ISLNK(lst.st_mode):
+                raise ValueError("Output path is a symlink; refusing to write")
+            if lst.st_ino != 0 and st.st_ino != 0 and (lst.st_ino != st.st_ino or lst.st_dev != st.st_dev):
+                raise ValueError("Output path is a symlink; refusing to write")
+        return os.fdopen(fd, "wb")
+    except Exception:
+        os.close(fd)
+        raise
 
 def encrypt(args):
     """Handle the encrypt subcommand."""
