@@ -2,68 +2,69 @@
 # SPDX-License-Identifier: MIT
 
 """Keyfile handling for two-factor protection."""
+import getpass
 import hashlib
 import os
 
+# Subprocess is used solely to execute icacls with an argument list for Windows ACL enforcement
+import subprocess  # nosec B404
+
 from . import config
+from ._util import safe_open_write
 
 
-def _is_case_insensitive_fs(path: str) -> bool:
-    """Determine whether the filesystem hosting `path` is case-insensitive.
+def _set_windows_permissions(path: str) -> None:
+    """Set owner-only read/write permissions on Windows using icacls.
 
-    Performs a safe, read-only check: tests whether alternating the case of
-    an existing path component resolves to the exact same file/directory on disk
-    via os.path.exists() and os.path.samefile().
+    Removes inherited permissions and grants read/write access solely
+    to the current user. If setting permissions fails, deletes the keyfile
+    and raises OSError.
     """
-    if os.name == "nt":
-        return True
     try:
-        cur = path
-        while cur and cur != os.path.dirname(cur):
-            base = os.path.basename(cur)
-            parent = os.path.dirname(cur)
-            for i, ch in enumerate(base):
-                if ch.isalpha():
-                    alt_base = base[:i] + (ch.lower() if ch.isupper() else ch.upper()) + base[i + 1:]
-                    alt_path = os.path.join(parent, alt_base)
-                    return os.path.exists(alt_path) and os.path.samefile(cur, alt_path)
-            cur = parent
-    except OSError:
-        pass
-    return False
+        try:
+            username = getpass.getuser()
+        except Exception:
+            username = os.environ.get("USERNAME")
+
+        if not username:
+            raise OSError("Could not determine current user to set Windows keyfile permissions")
+
+        abs_path = os.path.abspath(path)
+        cmd = [
+            "icacls",
+            abs_path,
+            "/inheritance:r",
+            "/grant:r",
+            f"{username}:(R,W)",
+        ]
+        try:
+            # icacls is invoked directly with an argument list without a shell for Windows ACL configuration
+            result = subprocess.run(  # nosec B603
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as e:
+            raise OSError(f"Failed to execute icacls to secure keyfile: {e}") from None
+
+        if result.returncode != 0 or (
+            "Failed processing" in result.stdout and "Failed processing 0 files" not in result.stdout
+        ):
+            err_msg = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+            raise OSError(f"Failed to set secure permissions on keyfile: {err_msg}")
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
 
 
-def safe_open_write(path):
-    """Open a file for writing in binary mode, after checking for symlinks and path safety.
-    Raises ValueError if the path is unsafe.
-    """
-    # Check for symlink on the given path (before resolving)
-    if os.path.islink(path):
-        raise ValueError("Output path is a symlink; refusing to write")
+def _is_windows() -> bool:
+    """Return True if the current operating system is Windows."""
+    return os.name == "nt"
 
-    # Get the real path (resolving symlinks)
-    real_path = os.path.realpath(path)
-    real_cwd = os.path.realpath(os.getcwd())
-    norm_path = os.path.normcase(real_path)
-    norm_cwd = os.path.normcase(real_cwd)
-
-    # If the underlying filesystem is case-insensitive (e.g. Windows NTFS, or default APFS
-    # on macOS where posixpath.normcase() is a no-op), fold case before commonpath containment check.
-    if _is_case_insensitive_fs(real_cwd):
-        norm_path = norm_path.lower()
-        norm_cwd = norm_cwd.lower()
-
-    try:
-        common_path = os.path.commonpath([norm_path, norm_cwd])
-    except ValueError:
-        raise ValueError("Output path attempts to escape the intended directory") from None
-
-    # Ensure the real path is within the real cwd
-    if common_path != norm_cwd:
-        raise ValueError("Output path attempts to escape the intended directory")
-
-    # Open the file for writing in binary mode
-    return open(path, 'wb')
 
 def generate_keyfile(path: str) -> None:
     """
@@ -74,10 +75,11 @@ def generate_keyfile(path: str) -> None:
 
     Raises:
         ValueError: If a file already exists at the given path, or if the path is unsafe.
+        OSError: If creating the keyfile or securing its permissions fails.
 
     Side effects:
-        Creates a file at `path` with 0o600 permissions containing
-        KEYFILE_LEN random bytes.
+        Creates a file at `path` with owner-only permissions (0o600 on POSIX,
+        restricted ACL on Windows) containing KEYFILE_LEN random bytes.
     """
     if os.path.exists(path):
         raise ValueError(f"Key file already exists at {path}. "
@@ -88,8 +90,13 @@ def generate_keyfile(path: str) -> None:
             f.write(keyfile_bytes)
     except OSError as e:
         raise OSError(f"Error creating keyfile: {e}") from None
-    # Restrict permissions to owner read/write only
-    os.chmod(path, 0o600)
+
+    if _is_windows():
+        _set_windows_permissions(path)
+        os.chmod(path, 0o600)
+    else:
+        # Restrict permissions to owner read/write only
+        os.chmod(path, 0o600)
 
 def load_keyfile(path: str) -> bytes:
     """

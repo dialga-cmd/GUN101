@@ -3,8 +3,10 @@
 
 """Test suite for GUN-101."""
 import base64
+import getpass
 import json
 import os
+import subprocess
 import tempfile
 
 import pytest
@@ -195,6 +197,52 @@ class TestNegative:
         container = handler.encrypt_file(data, password)
         decrypted = handler.decrypt_file(container, password)
         assert decrypted == data
+
+
+class TestPasswordPolicyConfiguration:
+    """Tests for centralized password policy configuration and validate_password."""
+
+    def test_valid_passwords_pass_validation(self):
+        """Valid passwords should pass validate_password without error."""
+        handler.validate_password(STRONG_PASSWORD)
+        handler.validate_password(STRONG_PASSWORD_2)
+
+    def test_non_string_password_fails(self):
+        """Non-string password should raise ValueError."""
+        with pytest.raises(ValueError, match="Password must be a string"):
+            handler.validate_password(12345)
+        with pytest.raises(ValueError, match="Password must be a string"):
+            handler.validate_password(b"Str0ngP@ssw0rd!")
+
+    def test_minimum_length_configured(self, monkeypatch):
+        """Custom PASSWORD_MIN_LENGTH should be respected by validate_password."""
+        monkeypatch.setattr(config, "PASSWORD_MIN_LENGTH", 6)
+        # 6 characters with upper, lower, digit, special should pass
+        handler.validate_password("Aa1!bc")
+        # 5 characters should fail with updated message
+        with pytest.raises(ValueError, match="Password must be at least 6 characters long"):
+            handler.validate_password("Aa1!b")
+
+    def test_disable_uppercase_requirement(self, monkeypatch):
+        """Disabling PASSWORD_REQUIRE_UPPERCASE allows passwords without uppercase."""
+        monkeypatch.setattr(config, "PASSWORD_REQUIRE_UPPERCASE", False)
+        handler.validate_password(WEAK_PASSWORD_NO_UPPER)
+
+    def test_disable_lowercase_requirement(self, monkeypatch):
+        """Disabling PASSWORD_REQUIRE_LOWERCASE allows passwords without lowercase."""
+        monkeypatch.setattr(config, "PASSWORD_REQUIRE_LOWERCASE", False)
+        handler.validate_password(WEAK_PASSWORD_NO_LOWER)
+
+    def test_disable_digit_requirement(self, monkeypatch):
+        """Disabling PASSWORD_REQUIRE_DIGIT allows passwords without digits."""
+        monkeypatch.setattr(config, "PASSWORD_REQUIRE_DIGIT", False)
+        handler.validate_password(WEAK_PASSWORD_NO_DIGIT)
+
+    def test_disable_special_requirement(self, monkeypatch):
+        """Disabling PASSWORD_REQUIRE_SPECIAL allows passwords without special characters."""
+        monkeypatch.setattr(config, "PASSWORD_REQUIRE_SPECIAL", False)
+        handler.validate_password(WEAK_PASSWORD_NO_SPECIAL)
+
 
 class TestCryptographicProperties:
     """Tests for cryptographic properties like non-determinism."""
@@ -414,6 +462,186 @@ class TestKeyfile:
             # Check permissions
             mode = os.stat(path).st_mode & 0o777
             assert mode == 0o600, f"Expected 0o600, got {oct(mode)}"
+
+    def test_generate_keyfile_windows_permissions_mocked_success(self, monkeypatch):
+        """On Windows, generate_keyfile should invoke icacls to grant owner-only access."""
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: True)
+        monkeypatch.setattr(keyfile.getpass, "getuser", lambda: "testuser")
+
+        recorded_cmd = []
+
+        def mock_run(cmd, **kwargs):
+            recorded_cmd.append((cmd, kwargs))
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=0,
+                stdout="Successfully processed 1 files; Failed processing 0 files",
+                stderr="",
+            )
+
+        monkeypatch.setattr(keyfile.subprocess, "run", mock_run)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                keyfile.generate_keyfile(path)
+                assert os.path.exists(path)
+                assert len(recorded_cmd) == 1
+                cmd, kwargs = recorded_cmd[0]
+                assert cmd[0] == "icacls"
+                assert os.path.abspath(path) in cmd
+                assert "/inheritance:r" in cmd
+                assert "/grant:r" in cmd
+                assert "testuser:(R,W)" in cmd
+                assert kwargs.get("shell") is not True
+            finally:
+                os.chdir(old_cwd)
+
+    def test_generate_keyfile_windows_permissions_failure_cleans_up(self, monkeypatch):
+        """When icacls fails on Windows, keyfile must be removed and OSError raised."""
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: True)
+        monkeypatch.setattr(keyfile.getpass, "getuser", lambda: "testuser")
+
+        def mock_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=5,
+                stdout="",
+                stderr="Access is denied",
+            )
+
+        monkeypatch.setattr(keyfile.subprocess, "run", mock_run)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                with pytest.raises(OSError, match="Failed to set secure permissions"):
+                    keyfile.generate_keyfile(path)
+                # Must not leave an unprotected keyfile behind
+                assert not os.path.exists(path)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_generate_keyfile_windows_permissions_icacls_not_found(self, monkeypatch):
+        """When icacls binary is missing on Windows, keyfile must be removed and OSError raised."""
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: True)
+        monkeypatch.setattr(keyfile.getpass, "getuser", lambda: "testuser")
+
+        def mock_run(cmd, **kwargs):
+            raise FileNotFoundError("icacls not found")
+
+        monkeypatch.setattr(keyfile.subprocess, "run", mock_run)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                with pytest.raises(OSError, match="Failed to execute icacls"):
+                    keyfile.generate_keyfile(path)
+                assert not os.path.exists(path)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_generate_keyfile_windows_permissions_no_user(self, monkeypatch):
+        """When username cannot be determined on Windows, keyfile must be removed and OSError raised."""
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: True)
+
+        def raise_user_error():
+            raise RuntimeError("no user")
+
+        monkeypatch.setattr(keyfile.getpass, "getuser", raise_user_error)
+        monkeypatch.delenv("USERNAME", raising=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                with pytest.raises(OSError, match="Could not determine current user"):
+                    keyfile.generate_keyfile(path)
+                assert not os.path.exists(path)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_generate_keyfile_posix_permissions(self, monkeypatch):
+        """On POSIX systems, generate_keyfile should apply 0o600 via os.chmod and not call icacls."""
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: False)
+
+        chmod_calls = []
+        orig_chmod = os.chmod
+
+        def tracking_chmod(p, mode):
+            chmod_calls.append((p, mode))
+            try:
+                orig_chmod(p, mode)
+            except OSError:
+                pass
+
+        monkeypatch.setattr(os, "chmod", tracking_chmod)
+        monkeypatch.setattr(
+            keyfile.subprocess,
+            "run",
+            lambda *args, **kwargs: pytest.fail("icacls should not be called on POSIX"),
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                keyfile.generate_keyfile(path)
+                assert os.path.exists(path)
+                assert any(mode == 0o600 for _, mode in chmod_calls)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_generate_keyfile_posix_chmod_failure_preserves_file(self, monkeypatch):
+        """On POSIX systems, if os.chmod fails, the exception must propagate and the keyfile must remain on disk."""
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: False)
+
+        def failing_chmod(p, mode):
+            raise PermissionError("chmod not permitted")
+
+        monkeypatch.setattr(os, "chmod", failing_chmod)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                with pytest.raises(PermissionError, match="chmod not permitted"):
+                    keyfile.generate_keyfile(path)
+                # POSIX behavior: keyfile was written and remains on disk
+                assert os.path.exists(path)
+            finally:
+                os.chdir(old_cwd)
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows-specific native ACL test")
+    def test_generate_keyfile_windows_native_permissions(self):
+        """Native Windows verification: generated keyfile is restricted to current user."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                keyfile.generate_keyfile(path)
+                assert os.path.exists(path)
+
+                res = subprocess.run(["icacls", path], capture_output=True, text=True, check=True)
+                assert "Successfully processed 1 files" in res.stdout
+                current_user = getpass.getuser()
+                assert current_user in res.stdout
+
+                # Verify file can be read normally by owner
+                data = keyfile.load_keyfile(path)
+                assert len(data) == config.KEYFILE_LEN
+            finally:
+                os.chdir(old_cwd)
 
     def test_generate_keyfile_raises_if_file_exists(self):
         """Generating a keyfile should fail if file already exists."""

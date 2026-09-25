@@ -166,7 +166,7 @@ class TestIssue2Regression:
         monkeypatch.setattr(os, "fstat", spoofed_fstat)
 
         with pytest.raises(ValueError, match="symlink"):
-            cli.safe_open_write(filename)
+            cli.safe_open_write(filename, force=True)
 
     def test_5_overwrite_existing_regular_file_works(self, run_in_tmpdir):
         """5. Existing regular file overwrite behavior is preserved."""
@@ -174,7 +174,7 @@ class TestIssue2Regression:
         with open(filename, "wb") as f:
             f.write(b"first version of content")
 
-        with cli.safe_open_write(filename) as f:
+        with cli.safe_open_write(filename, force=True) as f:
             f.write(b"second version of content")
 
         with open(filename, "rb") as f:
@@ -197,7 +197,7 @@ class TestIssue2Regression:
 
         # Encrypt second time (overwrite)
         container2 = handler.encrypt_file(b"updated payload", password, None)
-        with cli.safe_open_write("input.txt.gun101") as f:
+        with cli.safe_open_write("input.txt.gun101", force=True) as f:
             f.write(container2)
 
         # Decrypt to output file
