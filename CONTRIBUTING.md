@@ -42,14 +42,13 @@ are small, well-scoped tasks intended for new or casual contributors. Each one
 links to the code to touch and the tests to extend. Examples that have been
 sized to fit a single PR:
 
-- A **fuzzing harness** for the container parser (e.g. `hypothesis` or
-  `atheris`) targeting `decrypt_file` (see [ROADMAP.md](ROADMAP.md)).
-- A **`gun101 info` subcommand** that prints a container's cleartext header
-  without decrypting (see [ROADMAP.md](ROADMAP.md)).
-- **Windows file-permission support** for keyfiles so that `os.chmod`-style
-  restrictions work on NTFS (see [ROADMAP.md](ROADMAP.md)).
-- A **repeatable Argon2id benchmark** script so future parameter changes are
-  backed by measured numbers (see [ROADMAP.md](ROADMAP.md)).
+- **Windows file-permission support** — keyfile permissions are not enforced
+  on Windows/NTFS in the same way as POSIX systems; tracked in
+  [#8](https://github.com/dialga-cmd/GUN101/issues/8), see
+  [ROADMAP.md](ROADMAP.md).
+- **Deduplication of `safe_open_write()`** — consolidate the duplicate
+  implementations in `src/gun101/cli.py` and `src/gun101/keyfile.py` into a
+  shared internal helper.
 
 If you want to work on one of these (or propose your own small task), say so in
 a comment on the issue before opening a PR so work is not duplicated.
