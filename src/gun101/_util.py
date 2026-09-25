@@ -56,9 +56,13 @@ def validate_safe_path(path) -> None:
         raise ValueError("Output path attempts to escape the intended directory")
 
 
-def safe_open_write(path):
+def safe_open_write(path, force=False):
     """Open a file for writing in binary mode after validating its path.
     Raises ValueError if the path is unsafe.
+    Raises FileExistsError if force is False and the destination exists.
     """
     validate_safe_path(path)
-    return open(path, 'wb')
+    try:
+        return open(path, 'wb' if force else 'xb')
+    except FileExistsError:
+        raise FileExistsError(f"Output file already exists: {path}. Use --force to overwrite.") from None

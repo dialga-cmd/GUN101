@@ -51,8 +51,13 @@ def encrypt(args):
         sys.exit(1)
 
     output_path = args.output if args.output else (args.file + '.gun101')
+    force = getattr(args, 'force', False)
     try:
-        out_f = safe_open_write(output_path)
+        out_f = safe_open_write(output_path, force=force)
+    except FileExistsError as e:
+        in_f.close()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except (OSError, ValueError) as e:
         in_f.close()
         print(f"Error writing output file: {e}", file=sys.stderr)
@@ -96,6 +101,7 @@ def decrypt(args):
         else:
             output_path = args.file + '.decrypted'
 
+    force = getattr(args, 'force', False)
     try:
         validate_safe_path(output_path)
     except (OSError, ValueError) as e:
@@ -114,10 +120,28 @@ def decrypt(args):
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
 
+    output_reserved = False
     try:
         with in_f, temp_f:
             handler.decrypt_stream(in_f, temp_f, password, args.keyfile)
+        if not force:
+            with safe_open_write(output_path):
+                pass
+            output_reserved = True
         os.replace(temp_path, output_path)
+    except FileExistsError as e:
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+        if output_reserved:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except ValueError as e:
         try:
             if os.path.exists(temp_path):
@@ -132,6 +156,11 @@ def decrypt(args):
                 os.unlink(temp_path)
         except OSError:
             pass
+        if output_reserved:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -223,6 +252,7 @@ def main():
     encrypt_parser.add_argument('file', help='File to encrypt')
     encrypt_parser.add_argument('--keyfile', help='Path to keyfile for two-factor protection')
     encrypt_parser.add_argument('--output', help='Output file path (default: input.gun101)')
+    encrypt_parser.add_argument('-f', '--force', action='store_true', help='Overwrite output file if it already exists')
     # Removed --password argument
     encrypt_parser.set_defaults(func=encrypt)
 
@@ -231,6 +261,7 @@ def main():
     decrypt_parser.add_argument('file', help='File to decrypt')
     decrypt_parser.add_argument('--keyfile', help='Path to keyfile for two-factor protection')
     decrypt_parser.add_argument('--output', help='Output file path (default: strip .gun101 or add .decrypted)')
+    decrypt_parser.add_argument('-f', '--force', action='store_true', help='Overwrite output file if it already exists')
     # Removed --password argument
     decrypt_parser.set_defaults(func=decrypt)
 
