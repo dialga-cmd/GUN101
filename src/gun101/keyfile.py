@@ -2,11 +2,68 @@
 # SPDX-License-Identifier: MIT
 
 """Keyfile handling for two-factor protection."""
+import getpass
 import hashlib
 import os
 
+# Subprocess is used solely to execute icacls with an argument list for Windows ACL enforcement
+import subprocess  # nosec B404
+
 from . import config
 from ._util import safe_open_write
+
+
+def _set_windows_permissions(path: str) -> None:
+    """Set owner-only read/write permissions on Windows using icacls.
+
+    Removes inherited permissions and grants read/write access solely
+    to the current user. If setting permissions fails, deletes the keyfile
+    and raises OSError.
+    """
+    try:
+        try:
+            username = getpass.getuser()
+        except Exception:
+            username = os.environ.get("USERNAME")
+
+        if not username:
+            raise OSError("Could not determine current user to set Windows keyfile permissions")
+
+        abs_path = os.path.abspath(path)
+        cmd = [
+            "icacls",
+            abs_path,
+            "/inheritance:r",
+            "/grant:r",
+            f"{username}:(R,W)",
+        ]
+        try:
+            # icacls is invoked directly with an argument list without a shell for Windows ACL configuration
+            result = subprocess.run(  # nosec B603
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as e:
+            raise OSError(f"Failed to execute icacls to secure keyfile: {e}") from None
+
+        if result.returncode != 0 or (
+            "Failed processing" in result.stdout and "Failed processing 0 files" not in result.stdout
+        ):
+            err_msg = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+            raise OSError(f"Failed to set secure permissions on keyfile: {err_msg}")
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+
+
+def _is_windows() -> bool:
+    """Return True if the current operating system is Windows."""
+    return os.name == "nt"
 
 
 def generate_keyfile(path: str) -> None:
@@ -18,10 +75,11 @@ def generate_keyfile(path: str) -> None:
 
     Raises:
         ValueError: If a file already exists at the given path, or if the path is unsafe.
+        OSError: If creating the keyfile or securing its permissions fails.
 
     Side effects:
-        Creates a file at `path` with 0o600 permissions containing
-        KEYFILE_LEN random bytes.
+        Creates a file at `path` with owner-only permissions (0o600 on POSIX,
+        restricted ACL on Windows) containing KEYFILE_LEN random bytes.
     """
     if os.path.exists(path):
         raise ValueError(f"Key file already exists at {path}. "
@@ -32,8 +90,13 @@ def generate_keyfile(path: str) -> None:
             f.write(keyfile_bytes)
     except OSError as e:
         raise OSError(f"Error creating keyfile: {e}") from None
-    # Restrict permissions to owner read/write only
-    os.chmod(path, 0o600)
+
+    if _is_windows():
+        _set_windows_permissions(path)
+        os.chmod(path, 0o600)
+    else:
+        # Restrict permissions to owner read/write only
+        os.chmod(path, 0o600)
 
 def load_keyfile(path: str) -> bytes:
     """

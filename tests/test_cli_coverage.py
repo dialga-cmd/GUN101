@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import io
 import os
+import subprocess
 import sys
 
 import pytest
@@ -194,6 +195,19 @@ class TestGenerateKeyfileInProcess:
         _, err, exc = run(cli.generate_keyfile, make_arg(path="../outside.kf"))
         assert exc is not None and exc.code == 1
         assert "escape" in err
+
+    def test_generate_windows_permission_failure(self, workdir, monkeypatch):
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: True)
+        monkeypatch.setattr(keyfile.getpass, "getuser", lambda: "testuser")
+
+        def mock_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=5, stdout="", stderr="Access denied")
+
+        monkeypatch.setattr(keyfile.subprocess, "run", mock_run)
+        _, err, exc = run(cli.generate_keyfile, make_arg(path="failed.kf"))
+        assert exc is not None and exc.code == 1
+        assert "Error creating keyfile" in err
+        assert not os.path.exists("failed.kf")
 
 
 class TestKeyfileFingerprintInProcess:
