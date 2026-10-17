@@ -228,6 +228,34 @@ class TestEncryptOverwriteProtection:
             container = f.read()
         assert handler.decrypt_file(container, STRONG_PASSWORD) == b"hello world"
 
+    def test_encrypt_explicit_output_normal_when_not_exists(self, workdir, env_password):
+        """Encrypt with explicit --output when destination does not exist succeeds."""
+        with open("doc.txt", "wb") as f:
+            f.write(b"hello explicit")
+        assert not os.path.exists("custom_target.enc")
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="doc.txt", keyfile=None, output="custom_target.enc", force=False)
+        )
+        assert exc is None
+        assert os.path.exists("custom_target.enc")
+        with open("custom_target.enc", "rb") as f:
+            container = f.read()
+        assert handler.decrypt_file(container, STRONG_PASSWORD) == b"hello explicit"
+
+    def test_encrypt_with_force_when_output_does_not_exist(self, workdir, env_password):
+        """Encrypt with --force when destination does not exist succeeds."""
+        with open("doc.txt", "wb") as f:
+            f.write(b"hello new with force")
+        assert not os.path.exists("doc.txt.gun101")
+
+        out, err, exc = run_func(cli.encrypt, make_arg(file="doc.txt", keyfile=None, output=None, force=True))
+        assert exc is None
+        assert os.path.exists("doc.txt.gun101")
+        with open("doc.txt.gun101", "rb") as f:
+            container = f.read()
+        assert handler.decrypt_file(container, STRONG_PASSWORD) == b"hello new with force"
+
 
 # ---------------------------------------------------------------------------
 # Decrypt overwrite protection tests
@@ -340,6 +368,50 @@ class TestDecryptOverwriteProtection:
         assert os.path.exists("notes.txt")
         with open("notes.txt", "rb") as f:
             assert f.read() == b"fresh decrypted data"
+
+    def test_decrypt_explicit_output_normal_when_not_exists(self, workdir, env_password):
+        """Decrypt with explicit --output when destination does not exist succeeds."""
+        enc_file = self._create_container(payload=b"explicit target data", filename="notes.txt")
+        assert not os.path.exists("custom_plain.txt")
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file=enc_file, keyfile=None, output="custom_plain.txt", force=False)
+        )
+        assert exc is None
+        assert os.path.exists("custom_plain.txt")
+        with open("custom_plain.txt", "rb") as f:
+            assert f.read() == b"explicit target data"
+
+    def test_decrypt_with_force_when_output_does_not_exist(self, workdir, env_password):
+        """Decrypt with --force when destination does not exist succeeds."""
+        enc_file = self._create_container(payload=b"fresh data force", filename="notes.txt")
+        assert not os.path.exists("notes.txt")
+
+        out, err, exc = run_func(cli.decrypt, make_arg(file=enc_file, keyfile=None, output=None, force=True))
+        assert exc is None
+        assert os.path.exists("notes.txt")
+        with open("notes.txt", "rb") as f:
+            assert f.read() == b"fresh data force"
+
+    def test_decrypt_force_preserves_existing_destination_on_decryption_failure(
+        self, workdir, monkeypatch
+    ):
+        """Decrypt with --force preserves existing destination if decryption fails."""
+        container = handler.encrypt_file(b"payload", STRONG_PASSWORD)
+        with open("secret.txt.gun101", "wb") as f:
+            f.write(container)
+        with open("secret.txt", "wb") as f:
+            f.write(b"existing valuable data")
+
+        monkeypatch.setenv("GUN101_PASSWORD", "Wr0ngP@ssw0rd!")
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="secret.txt.gun101", keyfile=None, output=None, force=True)
+        )
+        assert exc is not None and exc.code == 1
+        assert "Decryption failed" in err
+
+        with open("secret.txt", "rb") as f:
+            assert f.read() == b"existing valuable data"
 
 
 # ---------------------------------------------------------------------------
