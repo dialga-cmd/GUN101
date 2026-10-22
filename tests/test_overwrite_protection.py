@@ -133,6 +133,37 @@ class TestSafeOpenWriteOverwriteProtection:
 
 
 class TestEncryptOverwriteProtection:
+    def test_existing_output_fails_before_encrypt_stream(
+        self, workdir, env_password, monkeypatch
+    ):
+        """An existing output must be rejected before encryption starts."""
+        input_path = workdir / "plain.bin"
+        output_path = workdir / "existing.enc"
+        input_path.write_bytes(b"new data")
+        output_path.write_bytes(b"existing container")
+
+        calls = []
+
+        def fake_encrypt_stream(*args, **kwargs):
+            calls.append(True)
+            raise AssertionError("Encryption should not start")
+
+        monkeypatch.setattr(handler, "encrypt_stream", fake_encrypt_stream)
+
+        args = make_arg(
+            file=str(input_path),
+            output=str(output_path),
+            keyfile=None,
+            force=False,
+        )
+
+        out, err, exc = run_func(cli.encrypt, args)
+
+        assert exc is not None and exc.code == 1
+        assert "Output file already exists" in err
+        assert calls == []
+        assert output_path.read_bytes() == b"existing container"
+
     def test_encrypt_default_output_exists_fails_without_force(self, workdir, env_password):
         """Encrypt when default output (<file>.gun101) already exists must fail without --force."""
         with open("doc.txt", "wb") as f:
@@ -478,6 +509,37 @@ class TestEncryptAtomicity:
 
 
 class TestDecryptOverwriteProtection:
+    def test_existing_output_fails_before_decrypt_stream(
+        self, workdir, env_password, monkeypatch
+    ):
+        """An existing output must be rejected before decryption starts."""
+        input_path = workdir / "encrypted.gun101"
+        output_path = workdir / "existing.txt"
+        input_path.write_bytes(b"encrypted input placeholder")
+        output_path.write_bytes(b"existing plaintext")
+
+        calls = []
+
+        def fake_decrypt_stream(*args, **kwargs):
+            calls.append(True)
+            raise AssertionError("Decryption should not start")
+
+        monkeypatch.setattr(handler, "decrypt_stream", fake_decrypt_stream)
+
+        args = make_arg(
+            file=str(input_path),
+            output=str(output_path),
+            keyfile=None,
+            force=False,
+        )
+
+        out, err, exc = run_func(cli.decrypt, args)
+
+        assert exc is not None and exc.code == 1
+        assert "Output file already exists" in err
+        assert calls == []
+        assert output_path.read_bytes() == b"existing plaintext"
+
     def _create_container(self, payload=b"original decrypted content", filename="doc.txt"):
         container = handler.encrypt_file(payload, STRONG_PASSWORD)
         enc_path = filename + ".gun101"
