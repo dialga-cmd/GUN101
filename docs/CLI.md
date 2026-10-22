@@ -39,7 +39,9 @@ controlling terminal and does not echo input.
 
 ## Password Policy
 
-Applies to both `encrypt` and `decrypt`. The password must be a string that:
+Enforced during **encryption only**. The `decrypt` command accepts existing
+passwords regardless of current policy (older files may have been encrypted
+with passwords that no longer meet the policy — see issue #4). The password must be a string that:
 
 - is at least **10 characters** long;
 - contains at least one **uppercase** letter;

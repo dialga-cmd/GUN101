@@ -69,9 +69,14 @@ The implementation follows the secure design principles enumerated from
    material, the derived key still requires the password. Legacy `v2.0`
    containers are handled separately and validated.
 3. **Fail securely.** Every cryptographic failure produces the generic
-   `"Decryption failed"` error — nothing is ever partially decrypted or
-   written before verification succeeds. Failure modes are indistinguishable by
-   design (see section 4, C1).
+   `"Decryption failed"` error. In the **CLI** path, plaintext is staged
+   to a temporary file and atomically moved only after GCM tag verification
+   succeeds (see `docs/CLI.md` — Memory Footprint section). In the **library**
+   API (`handler.decrypt_stream()`), plaintext chunks are written to
+   `out_stream` before `finalize()` verifies the GCM tag; callers using the
+   library API directly must handle partial output themselves (the function's
+   docstring warns about this). Failure modes are indistinguishable by design
+   (see section 4, C1).
 4. **Economy of mechanism / small attack surface.** The dependency set is
    deliberately minimal (two well-known crypto libraries), all cryptography is
    delegated to them, and no networking or key-exchange functionality exists.
