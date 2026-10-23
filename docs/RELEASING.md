@@ -64,11 +64,12 @@ on the PyPI release page).
 
 ### Verify the git tag
 
-The `vX.Y.Z` tags are signed. GitHub shows them as **Verified**. Locally:
-
-```bash
-git tag -v v2.2.2
-```
+The `vX.Y.Z` tags are intended to be signed with `git tag -s`. However,
+the `v2.2.2` tag is annotated but **not signed** — `git tag -v v2.2.2`
+returns `error: no signature found`. Either sign existing tags or update
+the documentation to reflect that signing is optional. Until signing is
+restored, users should verify the tag against the GitHub release page and the
+PyPI trusted publisher attestation instead.
 
 ## Checking a release before publishing (maintainers)
 

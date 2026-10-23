@@ -48,7 +48,9 @@ When a keyfile is used:
 
 ## Memory Wiping
 
-The library attempts to wipe sensitive keys from memory by overwriting the variable with zeros and deleting the reference. However, due to Python's garbage collection and the way strings and bytes objects are handled, **complete memory wiping cannot be guaranteed**. Advanced attackers with memory access might still recover keys. This limitation is accepted as part of the threat model.
+The library does **not** wipe keys from memory. Python's immutable  objects cannot be securely zeroed: the old  idiom only rebound the name without touching the original allocation, so it was removed. The  helper () performs  to drop the reference, but the underlying memory is reclaimed by CPython's garbage collector at an unspecified time.
+
+**Residual risk:** an attacker with process memory access (e.g., via  or a core dump) may recover key material after decryption. This is accepted as part of the threat model (see docs/THREAT_MODEL.md — hardware/physical compromise is out of scope). A mitigation requiring mutable buffers (e.g.,  with ) is possible but out of scope for the current design.
 
 ## What This Mode Protects Against
 

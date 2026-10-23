@@ -146,8 +146,9 @@ is necessary but not sufficient — your PR description must also carry the
 cryptographic justification described below.
 
 The suite covers correctness, tamper detection, password policy, keyfile
-handling, Argon2id/AES parameter assertions, and CLI behaviour. There is no
-fuzzing harness yet — a good-first-issue for fuzzing would be welcome.
+handling, Argon2id/AES parameter assertions, and CLI behaviour. A fuzzing harness exists at `tests/test_fuzz_parser.py` and is part of
+the test suite. To extend it, add new malformed input generators to the
+`FUZZ_INPUTS` list and assert the parser fails closed on each.
 
 ## Coding standards
 
