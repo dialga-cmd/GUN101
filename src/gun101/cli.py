@@ -93,6 +93,16 @@ def encrypt(args):
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Fail fast if the output already exists.
+    # The final safe_open_write check still protects against races.
+    if not force and os.path.lexists(output_path):
+        in_f.close()
+        print(
+            f"Error: Output file already exists: {output_path}. Use --force to overwrite.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Stage the container in the destination directory and publish it with an
     # atomic os.replace() only after encryption succeeds. Writing directly to
     # output_path would truncate a pre-existing container up front and the
@@ -175,6 +185,16 @@ def decrypt(args):
     except (OSError, ValueError) as e:
         in_f.close()
         print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Reject an existing destination before expensive decryption begins.
+    # The final safe_open_write check remains authoritative.
+    if not force and os.path.lexists(output_path):
+        in_f.close()
+        print(
+            f"Error: Output file already exists: {output_path}. Use --force to overwrite.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Stream to a temporary staging file in the target directory to prevent
