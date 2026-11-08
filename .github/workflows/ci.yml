@@ -45,6 +45,54 @@ jobs:
           (cd "$RUNNER_TEMP/dist-b" && sha256sum *) | cut -d' ' -f1 > /tmp/sha-b
           diff /tmp/sha-a /tmp/sha-b && echo "Build is reproducible"
 
+      - name: Verify built wheel in clean environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/venv-wheel"
+          if [ -d "$RUNNER_TEMP/venv-wheel/Scripts" ]; then
+            source "$RUNNER_TEMP/venv-wheel/Scripts/activate"
+          else
+            source "$RUNNER_TEMP/venv-wheel/bin/activate"
+          fi
+          pip install dist/*.whl
+          (cd "$RUNNER_TEMP" && python -c "import gun101; assert 'site-packages' in gun101.__file__, f'Not site-packages: {gun101.__file__}'")
+          mkdir -p "$RUNNER_TEMP/smoke-test-wheel"
+          (
+            cd "$RUNNER_TEMP/smoke-test-wheel"
+            gun101 --help
+            gun101 info
+            gun101 generate-keyfile "test.key"
+            gun101 keyfile-fingerprint "test.key"
+            echo "Wheel verification payload" > "input.txt"
+            GUN101_PASSWORD="ValidTestPass123!" gun101 encrypt "input.txt" --keyfile "test.key" --output "input.txt.gun101"
+            GUN101_PASSWORD="ValidTestPass123!" gun101 decrypt "input.txt.gun101" --keyfile "test.key" --output "decrypted.txt"
+            diff "input.txt" "decrypted.txt"
+          )
+
+      - name: Verify built sdist in clean environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/venv-sdist"
+          if [ -d "$RUNNER_TEMP/venv-sdist/Scripts" ]; then
+            source "$RUNNER_TEMP/venv-sdist/Scripts/activate"
+          else
+            source "$RUNNER_TEMP/venv-sdist/bin/activate"
+          fi
+          pip install dist/*.tar.gz
+          (cd "$RUNNER_TEMP" && python -c "import gun101; assert 'site-packages' in gun101.__file__, f'Not site-packages: {gun101.__file__}'")
+          mkdir -p "$RUNNER_TEMP/smoke-test-sdist"
+          (
+            cd "$RUNNER_TEMP/smoke-test-sdist"
+            gun101 --help
+            gun101 info
+            gun101 generate-keyfile "test.key"
+            gun101 keyfile-fingerprint "test.key"
+            echo "Sdist verification payload" > "input.txt"
+            GUN101_PASSWORD="ValidTestPass123!" gun101 encrypt "input.txt" --keyfile "test.key" --output "input.txt.gun101"
+            GUN101_PASSWORD="ValidTestPass123!" gun101 decrypt "input.txt.gun101" --keyfile "test.key" --output "decrypted.txt"
+            diff "input.txt" "decrypted.txt"
+          )
+
       - name: Lint (ruff)
         run: python -m ruff check src tests
 
