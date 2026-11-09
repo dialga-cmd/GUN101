@@ -4,6 +4,7 @@
 """Test suite for GUN-101."""
 import base64
 import getpass
+import io
 import json
 import os
 import subprocess
@@ -768,6 +769,84 @@ class TestKeyfile:
             # Decrypt with correct keyfile should succeed
             decrypted = handler.decrypt_file(container, password, keyfile_path)
             assert decrypted == data
+
+    @pytest.mark.parametrize(
+        "bad_fingerprint",
+        [
+            "\ud800",                      # Lone UTF-16 surrogate (Issue #43)
+            "\ud800" * 64,                 # 64-character lone surrogate string
+            "g" * 64,                      # Non-hexadecimal characters
+            "0" * 63,                      # Incorrect length (too short)
+            "0" * 65,                      # Incorrect length (too long)
+            "",                            # Empty string
+        ],
+    )
+    def test_decrypt_malformed_keyfile_fingerprint_fails_generically(
+        self, bad_fingerprint
+    ):
+        """Malformed keyfile_fingerprint must raise ValueError('Decryption failed').
+
+        Must fail consistently in both decrypt_file and decrypt_stream.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                keyfile_path = os.path.join(tmpdir, "keyfile")
+                keyfile.generate_keyfile(keyfile_path)
+                valid_container = handler.encrypt_file(b"payload", STRONG_PASSWORD, keyfile_path)
+
+                parsed = json.loads(valid_container.decode("utf-8"))
+                parsed["keyfile_fingerprint"] = bad_fingerprint
+                malformed_container = json.dumps(parsed).encode("utf-8")
+
+                with pytest.raises(ValueError, match="^Decryption failed$"):
+                    handler.decrypt_file(malformed_container, STRONG_PASSWORD, keyfile_path)
+
+                out_stream = io.BytesIO()
+                with pytest.raises(ValueError, match="^Decryption failed$"):
+                    handler.decrypt_stream(
+                        io.BytesIO(malformed_container),
+                        out_stream,
+                        STRONG_PASSWORD,
+                        keyfile_path,
+                    )
+            finally:
+                os.chdir(old_cwd)
+
+    def test_decrypt_uppercase_keyfile_fingerprint_accepted(self, monkeypatch):
+        """Valid uppercase hexadecimal fingerprint in container is accepted by decrypt_file and decrypt_stream."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                keyfile_path = os.path.join(tmpdir, "keyfile")
+                keyfile.generate_keyfile(keyfile_path)
+                payload = b"payload for uppercase fingerprint test"
+
+                # Simulate a container produced with an uppercase fingerprint
+                orig_fp = keyfile.keyfile_fingerprint
+                monkeypatch.setattr(keyfile, "keyfile_fingerprint", lambda b: orig_fp(b).upper())
+                container = handler.encrypt_file(payload, STRONG_PASSWORD, keyfile_path)
+                monkeypatch.undo()
+
+                parsed = json.loads(container.decode("utf-8"))
+                assert parsed["keyfile_fingerprint"].isupper()
+
+                # Both decrypt_file and decrypt_stream should accept the uppercase fingerprint
+                decrypted = handler.decrypt_file(container, STRONG_PASSWORD, keyfile_path)
+                assert decrypted == payload
+
+                out_stream = io.BytesIO()
+                handler.decrypt_stream(
+                    io.BytesIO(container),
+                    out_stream,
+                    STRONG_PASSWORD,
+                    keyfile_path,
+                )
+                assert out_stream.getvalue() == payload
+            finally:
+                os.chdir(old_cwd)
 
 
 

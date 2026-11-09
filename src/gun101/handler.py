@@ -26,6 +26,15 @@ def _discard_key(key: bytes) -> None:
     del key
 
 
+def _is_valid_fingerprint(fp: object) -> bool:
+    """Validate that fp is a 64-character hexadecimal string."""
+    return (
+        isinstance(fp, str)
+        and len(fp) == 64
+        and all(c in string.hexdigits for c in fp)
+    )
+
+
 def validate_password(password: str) -> None:
     """
     Validate password strength.
@@ -162,10 +171,10 @@ def decrypt_file(container_data: bytes, password: str, keyfile_path: str = None)
     if keyfile_path is not None:
         keyfile_bytes = keyfile.load_keyfile(keyfile_path)
         expected_fingerprint = container.get("keyfile_fingerprint")
-        if not isinstance(expected_fingerprint, str):
+        if not _is_valid_fingerprint(expected_fingerprint):
             raise ValueError("Decryption failed")
         actual_fingerprint = keyfile.keyfile_fingerprint(keyfile_bytes)
-        if not hmac.compare_digest(actual_fingerprint.encode('utf-8'), expected_fingerprint.encode('utf-8')):
+        if not hmac.compare_digest(actual_fingerprint.encode('utf-8'), expected_fingerprint.lower().encode('utf-8')):
             raise ValueError("Decryption failed")
 
     # Step 5: Decode salt, nonce, ciphertext, tag
@@ -552,10 +561,10 @@ def decrypt_stream(
     if keyfile_path is not None:
         keyfile_bytes = keyfile.load_keyfile(keyfile_path)
         expected_fingerprint = meta.get("keyfile_fingerprint")
-        if not isinstance(expected_fingerprint, str):
+        if not _is_valid_fingerprint(expected_fingerprint):
             raise ValueError("Decryption failed")
         actual_fingerprint = keyfile.keyfile_fingerprint(keyfile_bytes)
-        if not hmac.compare_digest(actual_fingerprint.encode("utf-8"), expected_fingerprint.encode("utf-8")):
+        if not hmac.compare_digest(actual_fingerprint.encode("utf-8"), expected_fingerprint.lower().encode("utf-8")):
             raise ValueError("Decryption failed")
 
     try:
