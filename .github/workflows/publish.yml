@@ -20,6 +20,47 @@ jobs:
         run: python -m pip install --upgrade build
       - name: Build distribution
         run: python -m build
+
+      - name: Verify built wheel in clean environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/venv-wheel"
+          source "$RUNNER_TEMP/venv-wheel/bin/activate"
+          pip install dist/*.whl
+          (cd "$RUNNER_TEMP" && python -c "import gun101; assert 'site-packages' in gun101.__file__, f'Not site-packages: {gun101.__file__}'")
+          mkdir -p "$RUNNER_TEMP/smoke-test-wheel"
+          (
+            cd "$RUNNER_TEMP/smoke-test-wheel"
+            gun101 --help
+            gun101 info
+            gun101 generate-keyfile "test.key"
+            gun101 keyfile-fingerprint "test.key"
+            echo "Wheel release verification payload" > "input.txt"
+            GUN101_PASSWORD="ValidTestPass123!" gun101 encrypt "input.txt" --keyfile "test.key" --output "input.txt.gun101"
+            GUN101_PASSWORD="ValidTestPass123!" gun101 decrypt "input.txt.gun101" --keyfile "test.key" --output "decrypted.txt"
+            diff "input.txt" "decrypted.txt"
+          )
+
+      - name: Verify built sdist in clean environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/venv-sdist"
+          source "$RUNNER_TEMP/venv-sdist/bin/activate"
+          pip install dist/*.tar.gz
+          (cd "$RUNNER_TEMP" && python -c "import gun101; assert 'site-packages' in gun101.__file__, f'Not site-packages: {gun101.__file__}'")
+          mkdir -p "$RUNNER_TEMP/smoke-test-sdist"
+          (
+            cd "$RUNNER_TEMP/smoke-test-sdist"
+            gun101 --help
+            gun101 info
+            gun101 generate-keyfile "test.key"
+            gun101 keyfile-fingerprint "test.key"
+            echo "Sdist release verification payload" > "input.txt"
+            GUN101_PASSWORD="ValidTestPass123!" gun101 encrypt "input.txt" --keyfile "test.key" --output "input.txt.gun101"
+            GUN101_PASSWORD="ValidTestPass123!" gun101 decrypt "input.txt.gun101" --keyfile "test.key" --output "decrypted.txt"
+            diff "input.txt" "decrypted.txt"
+          )
+
       - name: Publish package
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
