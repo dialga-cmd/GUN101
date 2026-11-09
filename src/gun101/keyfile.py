@@ -86,7 +86,7 @@ def generate_keyfile(path: str) -> None:
                 _set_windows_permissions(path)
             f.write(keyfile_bytes)
     except OSError as e:
-        if file_created and windows:
+        if file_created:
             try:
                 os.unlink(path)
             except FileNotFoundError:

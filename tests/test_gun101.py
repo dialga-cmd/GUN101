@@ -623,6 +623,86 @@ class TestKeyfile:
             finally:
                 os.chdir(old_cwd)
 
+    def test_generate_keyfile_posix_write_failure_cleans_up(self, monkeypatch):
+        """On POSIX systems, if writing key material fails, the incomplete keyfile must be unlinked."""
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: False)
+
+        orig_safe_open_write = keyfile.safe_open_write
+
+        class FailingWriteFile:
+            def __init__(self, real_file):
+                self._real_file = real_file
+
+            def __enter__(self):
+                self._real_file.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                # Ensure the underlying file descriptor is properly closed
+                return self._real_file.__exit__(exc_type, exc_val, exc_tb)
+
+            def write(self, data):
+                raise OSError("Disk quota exceeded")
+
+        def mock_safe_open_write(p):
+            real_file = orig_safe_open_write(p)
+            return FailingWriteFile(real_file)
+
+        monkeypatch.setattr(keyfile, "safe_open_write", mock_safe_open_write)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                with pytest.raises(OSError, match="Disk quota exceeded"):
+                    keyfile.generate_keyfile(path)
+                assert not os.path.exists(path)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_generate_keyfile_posix_context_exit_failure_cleans_up(self, monkeypatch):
+        """On POSIX systems, if closing the file fails, the incomplete keyfile must be unlinked."""
+        monkeypatch.setattr(keyfile, "_is_windows", lambda: False)
+
+        orig_safe_open_write = keyfile.safe_open_write
+
+        class FailingCloseFile:
+            def __init__(self, real_file):
+                self._real_file = real_file
+
+            def __enter__(self):
+                self._real_file.__enter__()
+                return self
+
+            def write(self, data):
+                return self._real_file.write(data)
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                # Ensure the underlying file descriptor is properly closed even when simulating failure
+                try:
+                    self._real_file.close()
+                except OSError:
+                    pass
+                raise OSError("I/O error during close")
+
+        def mock_safe_open_write(p):
+            real_file = orig_safe_open_write(p)
+            return FailingCloseFile(real_file)
+
+        monkeypatch.setattr(keyfile, "safe_open_write", mock_safe_open_write)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                path = os.path.join(tmpdir, "keyfile")
+                with pytest.raises(OSError, match="I/O error during close"):
+                    keyfile.generate_keyfile(path)
+                assert not os.path.exists(path)
+            finally:
+                os.chdir(old_cwd)
+
     @pytest.mark.skipif(os.name != "nt", reason="Windows-specific native ACL test")
     def test_generate_keyfile_windows_native_permissions(self):
         """Native Windows verification: generated keyfile is restricted to current user."""
