@@ -253,3 +253,55 @@ class TestIssue2Regression:
 
         with pytest.raises(ValueError, match="symlink"):
             cli.safe_open_write("raced_path.bin")
+
+    def test_8_safe_open_write_force_race_does_not_truncate_replacement_file(
+        self, run_in_tmpdir, monkeypatch
+    ):
+        """Issue #40: If a regular file is swapped between lstat and open, safe_open_write(force=True)
+        must reject the file and must NOT truncate the swapped-in victim file.
+        """
+        out_bin = os.path.abspath("out.bin")
+        repl_bin = os.path.abspath("replacement.bin")
+        saved_orig = os.path.abspath("saved_original.bin")
+
+        with open(out_bin, "wb") as f:
+            f.write(b"ORIGINAL A")
+        with open(repl_bin, "wb") as f:
+            f.write(b"VICTIM B CONTENT")
+
+        real_open = os.open
+        swapped = False
+
+        def racy_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            # When opening an existing file for overwrite, simulate swapping in replacement.bin
+            if not (flags & os.O_CREAT) and not swapped and os.path.abspath(path) == out_bin:
+                os.rename(out_bin, saved_orig)
+                os.replace(repl_bin, out_bin)
+                swapped = True
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", racy_open)
+
+        with pytest.raises(ValueError, match="symlink"):
+            cli.safe_open_write(out_bin, force=True)
+
+        # Confirm the victim file was NOT truncated and retains its original contents
+        with open(out_bin, "rb") as f:
+            assert f.read() == b"VICTIM B CONTENT"
+
+        # Confirm the original file contents remain untouched
+        with open(saved_orig, "rb") as f:
+            assert f.read() == b"ORIGINAL A"
+
+    def test_9_safe_open_write_force_truncates_intended_file(self, run_in_tmpdir):
+        """Confirm that safe_open_write(force=True) properly truncates an existing file."""
+        filename = "existing_truncate.bin"
+        with open(filename, "wb") as f:
+            f.write(b"INITIAL LONG CONTENT THAT SHOULD BE TRUNCATED")
+
+        with cli.safe_open_write(filename, force=True) as f:
+            f.write(b"short")
+
+        with open(filename, "rb") as f:
+            assert f.read() == b"short"
