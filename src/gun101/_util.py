@@ -97,7 +97,7 @@ def safe_open_write(path, force=False):
     binary_flag = getattr(os, "O_BINARY", 0)
     nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
     create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | binary_flag | nofollow_flag
-    trunc_flags = os.O_WRONLY | os.O_TRUNC | binary_flag | nofollow_flag
+    open_flags = os.O_WRONLY | binary_flag | nofollow_flag
 
     for _ in range(5):
         try:
@@ -123,7 +123,7 @@ def safe_open_write(path, force=False):
                 raise FileExistsError(f"Output file already exists: {path}. Use --force to overwrite.") from None
 
             try:
-                fd = os.open(path, trunc_flags, 0o600)
+                fd = os.open(path, open_flags, 0o600)
             except OSError as open_error:
                 if open_error.errno in (errno.ELOOP, getattr(errno, "EMLINK", None)) or os.path.islink(path):
                     raise ValueError("Output path is a symlink; refusing to write") from None
@@ -133,6 +133,8 @@ def safe_open_write(path, force=False):
 
             try:
                 _validate_open_file(fd, path, existing_stat)
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
                 return os.fdopen(fd, "wb")
             except Exception:
                 os.close(fd)
