@@ -400,6 +400,93 @@ class TestEncryptInputOutputSameFile:
             assert f.read() == payload
 
 
+class TestDecryptInputOutputSameFile:
+    """Regression tests for GitHub Issue #38: decrypt --force --output <input>."""
+
+    @staticmethod
+    def _create_container(payload=b"precious ciphertext that must survive", filename="doc.txt.gun101"):
+        container = handler.encrypt_file(payload, STRONG_PASSWORD)
+        with open(filename, "wb") as f:
+            f.write(container)
+        return filename, container
+
+    @staticmethod
+    def _staging_leftovers():
+        return [name for name in os.listdir(".") if ".tmp." in name]
+
+    def test_same_path_refused_even_with_force(self, workdir, env_password):
+        """Decrypting onto the input container itself must be refused even with --force."""
+        filename, original_bytes = self._create_container()
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file=filename, keyfile=None, output=filename, force=True)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "Refusing to overwrite the input file" in err
+        with open(filename, "rb") as f:
+            assert f.read() == original_bytes
+        assert self._staging_leftovers() == []
+
+    def test_relative_alias_refused(self, workdir, env_password):
+        """A relative path alias of the input file must also be refused."""
+        filename, original_bytes = self._create_container()
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file=filename, keyfile=None, output=f"./{filename}", force=True)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "Refusing to overwrite the input file" in err
+        with open(filename, "rb") as f:
+            assert f.read() == original_bytes
+        assert self._staging_leftovers() == []
+
+    def test_symlink_to_input_refused(self, workdir, env_password):
+        """An output symlink resolving to the input container must be refused."""
+        filename, original_bytes = self._create_container()
+        alias_name = "alias.gun101"
+        try:
+            os.symlink(filename, alias_name)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are not available on this platform")
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file=filename, keyfile=None, output=alias_name, force=True)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "Refusing to overwrite the input file" in err
+        assert os.path.islink(alias_name)
+        with open(filename, "rb") as f:
+            assert f.read() == original_bytes
+        assert self._staging_leftovers() == []
+
+    def test_hardlink_to_input_refused(self, workdir, env_password):
+        """A hard link to the input container is the same inode and must be refused."""
+        filename, original_bytes = self._create_container()
+        hard_name = "hard.gun101"
+        try:
+            os.link(filename, hard_name)
+        except (OSError, NotImplementedError):
+            pytest.skip("hard links are not available on this platform")
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file=filename, keyfile=None, output=hard_name, force=True)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "Refusing to overwrite the input file" in err
+        # Preserves both filesystem entries
+        assert os.path.exists(filename)
+        assert os.path.exists(hard_name)
+        with open(filename, "rb") as f:
+            assert f.read() == original_bytes
+        with open(hard_name, "rb") as f:
+            assert f.read() == original_bytes
+        assert self._staging_leftovers() == []
+
+
 # ---------------------------------------------------------------------------
 # Encrypt atomicity tests (GitHub Issue #36)
 # ---------------------------------------------------------------------------

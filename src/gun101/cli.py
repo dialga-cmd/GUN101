@@ -15,11 +15,11 @@ from ._util import _same_file, safe_open_write, validate_safe_path
 def _refers_to_same_file(in_f, input_path: str, output_path: str) -> bool:
     """Return True when ``output_path`` resolves to the file open on ``in_f``.
 
-    This guards against encrypting a file onto itself: opening the destination
-    with ``O_TRUNC`` would destroy the plaintext before the first read
-    (GitHub issue #35). The inode comparison catches hard links; the resolved
-    path comparison catches symlink aliases and filesystems that do not report
-    usable inode numbers. Returns False when the output does not exist.
+    This guards against encrypting or decrypting a file onto itself: opening the
+    destination would destroy or overwrite the input file (GitHub issues #35, #38).
+    The inode comparison catches hard links; the resolved path comparison catches
+    symlink aliases and filesystems that do not report usable inode numbers.
+    Returns False when the output does not exist.
     """
     try:
         output_stat = os.stat(output_path)
@@ -180,6 +180,17 @@ def decrypt(args):
             output_path = args.file + '.decrypted'
 
     force = getattr(args, 'force', False)
+
+    # Never let the destination alias the input. With --force, decryption would
+    # replace the encrypted container with decrypted plaintext (issue #38).
+    if _refers_to_same_file(in_f, args.file, output_path):
+        in_f.close()
+        print(
+            "Error: Refusing to overwrite the input file; choose a different --output path",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     try:
         validate_safe_path(output_path)
     except (OSError, ValueError) as e:
