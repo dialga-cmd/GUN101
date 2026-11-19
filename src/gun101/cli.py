@@ -3,13 +3,14 @@
 
 """Command-line interface for GUN-101."""
 import argparse
+import errno
 import getpass
 import importlib.metadata
 import os
 import sys
 
 from . import config, handler, keyfile
-from ._util import _same_file, safe_open_write, validate_safe_path
+from ._util import _same_file, safe_open_write, validate_safe_path  # noqa: F401
 
 
 def _refers_to_same_file(in_f, input_path: str, output_path: str) -> bool:
@@ -30,6 +31,64 @@ def _refers_to_same_file(in_f, input_path: str, output_path: str) -> bool:
         return True
     return os.path.realpath(input_path) == os.path.realpath(output_path)
 
+
+def _publish_staging_file(staging_path: str, output_path: str, force: bool = False) -> None:
+    """Atomically publish staging_path to output_path.
+
+    When force=True:
+        Uses os.replace() to atomically replace any pre-existing file at output_path.
+
+    When force=False:
+        Atomically links or renames staging_path to output_path without overwriting.
+        If output_path exists at publication time (including if created concurrently
+        by another process), fails with FileExistsError without modifying output_path.
+    """
+    if force:
+        os.replace(staging_path, output_path)
+        return
+
+    validate_safe_path(output_path)
+    if os.path.lexists(output_path):
+        raise FileExistsError(
+            f"Output file already exists: {output_path}. Use --force to overwrite."
+        )
+
+    if sys.platform == "win32":
+        try:
+            os.rename(staging_path, output_path)
+        except FileExistsError:
+            raise FileExistsError(
+                f"Output file already exists: {output_path}. Use --force to overwrite."
+            ) from None
+        return
+
+    try:
+        os.link(staging_path, output_path)
+    except FileExistsError:
+        raise FileExistsError(
+            f"Output file already exists: {output_path}. Use --force to overwrite."
+        ) from None
+    except OSError as e:
+        if e.errno in (
+            errno.EPERM,
+            errno.EXDEV,
+            getattr(errno, "ENOTSUP", None),
+            getattr(errno, "EOPNOTSUPP", None),
+            getattr(errno, "EMLINK", None),
+        ):
+            raise OSError(
+                f"Atomic publication failed because hard links are unsupported or prohibited: {e}. "
+                "Use --force to overwrite."
+            ) from e
+        raise
+
+    # Destination is published. Remove the temporary staging link.
+    # If unlinking fails, the destination has already been published safely,
+    # so do not report publication failure or touch output_path.
+    try:
+        os.unlink(staging_path)
+    except OSError:
+        pass
 
 
 def get_password():
@@ -70,7 +129,7 @@ def encrypt(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    output_path = args.output if args.output else (args.file + '.gun101')
+    output_path = args.output if args.output is not None else (args.file + '.gun101')
     force = getattr(args, 'force', False)
 
     # Never let the destination alias the input. With --force, safe_open_write
@@ -107,33 +166,70 @@ def encrypt(args):
     # atomic os.replace() only after encryption succeeds. Writing directly to
     # output_path would truncate a pre-existing container up front and the
     # error path would then unlink it, destroying the old file (issue #36).
-    temp_dir = os.path.dirname(os.path.abspath(output_path))
-    temp_path = os.path.join(temp_dir, f".{os.path.basename(output_path)}.tmp.{os.urandom(8).hex()}")
+    dest_dir = os.path.dirname(os.path.abspath(output_path))
+    temp_dir = dest_dir
+    temp_name = f".gun101.tmp.{os.urandom(16).hex()}"
+    temp_path = os.path.join(temp_dir, temp_name)
+
+    # Explicitly verify the destination parent and staging parent relationship.
+    staging_dir = os.path.dirname(os.path.abspath(temp_path))
+    if os.path.normcase(os.path.abspath(staging_dir)) != os.path.normcase(os.path.abspath(dest_dir)):
+        in_f.close()
+        print("Error writing output file: Staging path escaped destination directory", file=sys.stderr)
+        sys.exit(1)
+    if os.path.exists(dest_dir) and os.path.exists(staging_dir):
+        if not os.path.samefile(dest_dir, staging_dir):
+            in_f.close()
+            print("Error writing output file: Staging path escaped destination directory", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        validate_safe_path(temp_path)
+    except (OSError, ValueError) as e:
+        in_f.close()
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
         temp_fd = os.open(
             temp_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            flags,
             0o600,
         )
-        temp_f = os.fdopen(temp_fd, "wb")
     except OSError as e:
         in_f.close()
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    output_reserved = False
-
-    def cleanup_staging():
+    try:
+        temp_f = os.fdopen(temp_fd, "wb")
+    except Exception as e:
+        try:
+            os.close(temp_fd)
+        except OSError:
+            pass
         try:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
         except OSError:
             pass
-        if output_reserved:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+        in_f.close()
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    def cleanup_staging():
+        try:
+            if os.path.lexists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
 
     try:
         with in_f, temp_f:
@@ -141,11 +237,7 @@ def encrypt(args):
         # os.replace() preserves the source inode's mode, so re-assert 0o600 on
         # the staging file before it becomes visible at output_path.
         os.chmod(temp_path, 0o600)
-        if not force:
-            with safe_open_write(output_path):
-                pass
-            output_reserved = True
-        os.replace(temp_path, output_path)
+        _publish_staging_file(temp_path, output_path, force=force)
     except FileExistsError as e:
         cleanup_staging()
         print(f"Error: {e}", file=sys.stderr)
@@ -154,6 +246,9 @@ def encrypt(args):
         cleanup_staging()
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        cleanup_staging()
+        raise
     except Exception as e:
         cleanup_staging()
         print(f"Error writing output file: {e}", file=sys.stderr)
@@ -199,25 +294,75 @@ def decrypt(args):
 
     # Stream to a temporary staging file in the target directory to prevent
     # release of unverified plaintext and ensure atomic replacement.
-    temp_dir = os.path.dirname(os.path.abspath(output_path))
-    temp_path = os.path.join(temp_dir, f".{os.path.basename(output_path)}.tmp.{os.urandom(8).hex()}")
+    dest_dir = os.path.dirname(os.path.abspath(output_path))
+    temp_dir = dest_dir
+    temp_name = f".gun101.tmp.{os.urandom(16).hex()}"
+    temp_path = os.path.join(temp_dir, temp_name)
+
+    # Explicitly verify the destination parent and staging parent relationship.
+    staging_dir = os.path.dirname(os.path.abspath(temp_path))
+    if os.path.normcase(os.path.abspath(staging_dir)) != os.path.normcase(os.path.abspath(dest_dir)):
+        in_f.close()
+        print("Error writing output file: Staging path escaped destination directory", file=sys.stderr)
+        sys.exit(1)
+    if os.path.exists(dest_dir) and os.path.exists(staging_dir):
+        if not os.path.samefile(dest_dir, staging_dir):
+            in_f.close()
+            print("Error writing output file: Staging path escaped destination directory", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        validate_safe_path(temp_path)
+    except (OSError, ValueError) as e:
+        in_f.close()
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
     # Create the staging file with 0o600 from the outset. Using open(...,'wb')
     # would apply the process umask instead, leaving decrypted plaintext
     # world-readable for the whole duration of decryption (and in the final
     # output, since os.replace carries the source file's mode across).
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
         temp_fd = os.open(
             temp_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            flags,
             0o600,
         )
-        temp_f = os.fdopen(temp_fd, "wb")
     except OSError as e:
         in_f.close()
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    output_reserved = False
+    try:
+        temp_f = os.fdopen(temp_fd, "wb")
+    except Exception as e:
+        try:
+            os.close(temp_fd)
+        except OSError:
+            pass
+        try:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+        in_f.close()
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    def cleanup_staging():
+        try:
+            if os.path.lexists(temp_path):
+                os.unlink(temp_path)
+        except OSError:
+            pass
+
     try:
         with in_f, temp_f:
             handler.decrypt_stream(in_f, temp_f, password, args.keyfile)
@@ -227,43 +372,20 @@ def decrypt(args):
         # aborts while the plaintext is still confined to the staging file,
         # rather than failing after it has been installed at output_path.
         os.chmod(temp_path, 0o600)
-        if not force:
-            with safe_open_write(output_path):
-                pass
-            output_reserved = True
-        os.replace(temp_path, output_path)
+        _publish_staging_file(temp_path, output_path, force=force)
     except FileExistsError as e:
-        try:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-        except OSError:
-            pass
-        if output_reserved:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+        cleanup_staging()
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     except ValueError as e:
-        try:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-        except OSError:
-            pass
+        cleanup_staging()
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    except KeyboardInterrupt:
+        cleanup_staging()
+        raise
     except Exception as e:
-        try:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-        except OSError:
-            pass
-        if output_reserved:
-            try:
-                os.unlink(output_path)
-            except OSError:
-                pass
+        cleanup_staging()
         print(f"Error writing output file: {e}", file=sys.stderr)
         sys.exit(1)
 

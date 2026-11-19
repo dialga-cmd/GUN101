@@ -35,12 +35,26 @@ def _is_case_insensitive_fs(path: str) -> bool:
 def validate_safe_path(path) -> None:
     """Validate a path for safe output creation.
 
-    Raises ValueError if the path is a symlink or escapes the current working directory.
+    Raises ValueError if the path is empty, is a directory, is a symlink,
+    or escapes the current working directory.
     """
-    if os.path.islink(path):
+    if path is None or not isinstance(path, (str, os.PathLike)) or not str(path).strip():
+        raise ValueError("Output path cannot be empty")
+
+    path_str = str(path)
+
+    if os.path.islink(path_str):
         raise ValueError("Output path is a symlink; refusing to write")
 
-    real_path = os.path.realpath(path)
+    if (
+        path_str.endswith(("/", "\\"))
+        or path_str.endswith(("/.", "\\.", "/..", "\\.."))
+        or os.path.basename(os.path.normpath(path_str)) in ("", ".", "..")
+        or os.path.isdir(path_str)
+    ):
+        raise ValueError(f"Output path cannot be a directory: {path}")
+
+    real_path = os.path.realpath(path_str)
     real_cwd = os.path.realpath(os.getcwd())
     norm_path = os.path.normcase(real_path)
     norm_cwd = os.path.normcase(real_cwd)
@@ -48,6 +62,9 @@ def validate_safe_path(path) -> None:
     if _is_case_insensitive_fs(real_cwd):
         norm_path = norm_path.lower()
         norm_cwd = norm_cwd.lower()
+
+    if norm_path == norm_cwd:
+        raise ValueError(f"Output path cannot be a directory: {path}")
 
     try:
         common_path = os.path.commonpath([norm_path, norm_cwd])

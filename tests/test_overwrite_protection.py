@@ -5,6 +5,7 @@
 
 import argparse
 import contextlib
+import errno
 import io
 import os
 import stat
@@ -16,6 +17,20 @@ import pytest
 from gun101 import cli, config, handler
 
 STRONG_PASSWORD = "Str0ngP@ssw0rd!"
+
+UNSUPPORTED_HARDLINK_ERRNOS = sorted(
+    {
+        err
+        for err in [
+            errno.EPERM,
+            errno.EXDEV,
+            getattr(errno, "ENOTSUP", None),
+            getattr(errno, "EOPNOTSUPP", None),
+            getattr(errno, "EMLINK", None),
+        ]
+        if err is not None
+    }
+)
 
 
 @pytest.fixture(autouse=True)
@@ -457,6 +472,8 @@ class TestEncryptAtomicity:
             raise OSError("simulated rename failure")
 
         monkeypatch.setattr(os, "replace", boom)
+        monkeypatch.setattr(os, "rename", boom)
+        monkeypatch.setattr(os, "link", boom)
         out, err, exc = run_func(
             cli.encrypt, make_arg(file="plain.bin", keyfile=None, output="new.enc", force=False)
         )
@@ -943,3 +960,711 @@ class TestDecryptedOutputPermissions:
         leftovers = [p.name for p in workdir.iterdir() if ".tmp." in p.name]
         assert not leftovers, f"staging files left behind: {leftovers}"
         assert not (workdir / "out.txt").exists()
+
+
+class TestStagingPathSecurity:
+    """Regression tests for GitHub Issue #39: Staging path construction security."""
+
+    def test_decrypt_dot_gun101_default_output_rejected_before_staging(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Decrypting .gun101 with default output must be rejected before any staging file is created."""
+        enc = handler.encrypt_file(b"secret payload", STRONG_PASSWORD)
+        (workdir / ".gun101").write_bytes(enc)
+
+        opened_paths = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            opened_paths.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file=".gun101", keyfile=None, output=None, force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "Output path cannot be empty" in err
+        # Assert rejection happened before any staging file was opened
+        assert not any(".tmp." in p for p in opened_paths), f"Staging file opened: {opened_paths}"
+        assert not list(workdir.glob("*.tmp.*"))
+        assert not list(workdir.parent.glob("*.tmp.*"))
+
+    def test_encrypt_explicit_empty_output_rejected_before_staging(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Explicit --output '' during encryption must be rejected before any staging."""
+        (workdir / "in.txt").write_bytes(b"content")
+
+        opened_paths = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            opened_paths.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="", force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "Output path cannot be empty" in err
+        assert not any(".tmp." in p for p in opened_paths), f"Staging file opened: {opened_paths}"
+        assert not (workdir / "in.txt.gun101").exists()
+
+    def test_decrypt_explicit_empty_output_rejected_before_staging(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Explicit --output '' during decryption must be rejected before any staging."""
+        enc = handler.encrypt_file(b"content", STRONG_PASSWORD)
+        (workdir / "in.txt.gun101").write_bytes(enc)
+
+        opened_paths = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            opened_paths.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="in.txt.gun101", keyfile=None, output="", force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "Output path cannot be empty" in err
+        assert not any(".tmp." in p for p in opened_paths), f"Staging file opened: {opened_paths}"
+        assert not list(workdir.parent.glob("*.tmp.*"))
+
+    def test_encrypt_and_decrypt_output_dot_rejected_before_staging(
+        self, workdir, env_password, monkeypatch
+    ):
+        """--output '.' must be rejected before any staging file is created."""
+        (workdir / "in.txt").write_bytes(b"content")
+        enc = handler.encrypt_file(b"content", STRONG_PASSWORD)
+        (workdir / "in.txt.gun101").write_bytes(enc)
+
+        opened_paths = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            opened_paths.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        # Encrypt with output='.'
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output=".", force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "Output path cannot be a directory" in err
+        assert not any(".tmp." in p for p in opened_paths), f"Staging file opened: {opened_paths}"
+
+        # Decrypt with output='.'
+        opened_paths.clear()
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="in.txt.gun101", keyfile=None, output=".", force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "Output path cannot be a directory" in err
+        assert not any(".tmp." in p for p in opened_paths), f"Staging file opened: {opened_paths}"
+        assert not list(workdir.parent.glob("*.tmp.*"))
+
+    def test_output_existing_directory_rejected_before_staging(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Existing directory output targets must be rejected before staging."""
+        (workdir / "in.txt").write_bytes(b"content")
+        target_dir = workdir / "target_dir"
+        target_dir.mkdir()
+
+        opened_paths = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            opened_paths.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output=str(target_dir), force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "Output path cannot be a directory" in err
+        assert not any(".tmp." in p for p in opened_paths)
+
+        # Path explicitly ending with separator
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output=f"{target_dir}{os.sep}", force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "Output path cannot be a directory" in err
+        assert not any(".tmp." in p for p in opened_paths)
+
+    def test_long_output_basename_staging_success(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Valid long output basenames near NAME_MAX must succeed with fixed-length staging."""
+        basename_240 = "a" * 240
+        try:
+            probe_path = workdir / basename_240
+            probe_path.write_bytes(b"probe")
+            probe_path.unlink()
+        except OSError:
+            pytest.skip("240-byte basenames not supported in this environment/filesystem")
+
+        (workdir / "in.txt").write_bytes(b"payload 12345")
+        opened_staging = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            if ".tmp." in str(path):
+                opened_staging.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output=basename_240, force=False)
+        )
+        assert exc is None, err
+        assert (workdir / basename_240).exists()
+        assert len(opened_staging) == 1
+        # Staging filename must be independent of the 240-byte basename (e.g. 44 bytes)
+        staging_filename = os.path.basename(opened_staging[0])
+        assert len(staging_filename) < 100
+        assert len(staging_filename) == 44
+
+    def test_staging_file_created_in_destination_parent_directory(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Staging files must be created in the destination's parent directory."""
+        sub = workdir / "nested_dir"
+        sub.mkdir()
+        (workdir / "in.txt").write_bytes(b"payload")
+
+        opened_staging = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            if ".tmp." in str(path):
+                opened_staging.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        dest_file = sub / "encrypted.gun101"
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output=str(dest_file), force=False)
+        )
+        assert exc is None, err
+        assert len(opened_staging) == 1
+        staging_dir = os.path.dirname(os.path.abspath(opened_staging[0]))
+        assert staging_dir == os.path.abspath(str(sub))
+        assert not list(workdir.glob("*.tmp.*"))
+        assert not list(workdir.parent.glob("*.tmp.*"))
+
+    def test_staging_cleanup_after_failed_encryption_and_decryption(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Failed encryption and decryption must clean up staging files."""
+        (workdir / "in.txt").write_bytes(b"payload")
+
+        # Simulate encryption failure
+        def mock_encrypt_fail(*args, **kwargs):
+            raise RuntimeError("simulated encryption failure")
+
+        monkeypatch.setattr(handler, "encrypt_stream", mock_encrypt_fail)
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="out.gun101", force=False)
+        )
+        assert exc is not None
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+
+        # Simulate decryption failure
+        enc = handler.encrypt_file(b"valid", STRONG_PASSWORD)
+        (workdir / "test.gun101").write_bytes(enc)
+        monkeypatch.setenv("GUN101_PASSWORD", "WrongP@ssword1!")
+        monkeypatch.undo()  # restore handler.encrypt_stream
+        monkeypatch.setenv("GUN101_PASSWORD", "WrongP@ssword1!")
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="test.gun101", keyfile=None, output="out.txt", force=False)
+        )
+        assert exc is not None
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+
+    def test_staging_filename_fixed_length_independent_of_basename(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Staging filename must always have fixed length 44 independent of output basename."""
+        (workdir / "in.txt").write_bytes(b"payload")
+        opened_staging = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            if ".tmp." in str(path):
+                opened_staging.append(str(path))
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        for name in ["short.out", "somewhat_longer_filename_with_many_characters_123456789.out"]:
+            opened_staging.clear()
+            out, err, exc = run_func(
+                cli.encrypt, make_arg(file="in.txt", keyfile=None, output=name, force=False)
+            )
+            assert exc is None, err
+            assert len(opened_staging) == 1
+            st_name = os.path.basename(opened_staging[0])
+            assert len(st_name) == 44
+            assert st_name.startswith(".gun101.tmp.")
+
+    def test_normal_encryption_and_decryption_works(
+        self, workdir, env_password
+    ):
+        """End-to-end encryption and decryption must succeed and preserve exact content."""
+        payload = b"Hello, world! Safe staging test.\n" * 100
+        (workdir / "plain.txt").write_bytes(payload)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="plain.txt", keyfile=None, output="plain.gun101", force=False)
+        )
+        assert exc is None, err
+        assert (workdir / "plain.gun101").exists()
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="plain.gun101", keyfile=None, output="decrypted.txt", force=False)
+        )
+        assert exc is None, err
+        assert (workdir / "decrypted.txt").read_bytes() == payload
+
+    def test_encrypt_fdopen_failure_closes_fd_and_cleans_up(
+        self, workdir, env_password, monkeypatch
+    ):
+        """If os.fdopen fails in encrypt(), the specific temp_fd is closed and staging file removed."""
+        (workdir / "in.txt").write_bytes(b"content")
+
+        opened_staging_fds = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if ".tmp." in str(path):
+                opened_staging_fds.append(fd)
+            return fd
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        closed_fds = []
+        real_close = os.close
+
+        def spy_close(fd):
+            closed_fds.append(fd)
+            return real_close(fd)
+
+        monkeypatch.setattr(os, "close", spy_close)
+
+        def mock_fdopen(fd, mode="r", *args, **kwargs):
+            raise OSError("simulated fdopen failure")
+
+        monkeypatch.setattr(os, "fdopen", mock_fdopen)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="out.gun101", force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "simulated fdopen failure" in err
+        assert len(opened_staging_fds) == 1
+        # Specifically verify the temporary staging descriptor was closed
+        assert opened_staging_fds[0] in closed_fds
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+
+    def test_decrypt_fdopen_failure_closes_fd_and_cleans_up(
+        self, workdir, env_password, monkeypatch
+    ):
+        """If os.fdopen fails in decrypt(), the specific temp_fd is closed and staging file removed."""
+        enc = handler.encrypt_file(b"content", STRONG_PASSWORD)
+        (workdir / "in.txt.gun101").write_bytes(enc)
+
+        opened_staging_fds = []
+        real_open = os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if ".tmp." in str(path):
+                opened_staging_fds.append(fd)
+            return fd
+
+        monkeypatch.setattr(os, "open", spy_open)
+
+        closed_fds = []
+        real_close = os.close
+
+        def spy_close(fd):
+            closed_fds.append(fd)
+            return real_close(fd)
+
+        monkeypatch.setattr(os, "close", spy_close)
+
+        def mock_fdopen(fd, mode="r", *args, **kwargs):
+            raise OSError("simulated fdopen failure")
+
+        monkeypatch.setattr(os, "fdopen", mock_fdopen)
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="in.txt.gun101", keyfile=None, output="out.txt", force=False)
+        )
+        assert exc is not None and exc.code == 1
+        assert "simulated fdopen failure" in err
+        assert len(opened_staging_fds) == 1
+        # Specifically verify the temporary staging descriptor was closed
+        assert opened_staging_fds[0] in closed_fds
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+
+    def test_encrypt_keyboard_interrupt_cleans_up_staging_and_raises(
+        self, workdir, env_password, monkeypatch
+    ):
+        """KeyboardInterrupt during encryption must clean up staging file and re-raise."""
+        (workdir / "in.txt").write_bytes(b"content")
+
+        def mock_encrypt_interrupt(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(handler, "encrypt_stream", mock_encrypt_interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            cli.encrypt(make_arg(file="in.txt", keyfile=None, output="out.gun101", force=False))
+
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+        assert not (workdir / "out.gun101").exists()
+
+    def test_decrypt_keyboard_interrupt_cleans_up_staging_and_raises(
+        self, workdir, env_password, monkeypatch
+    ):
+        """KeyboardInterrupt during decryption must clean up staging file and re-raise."""
+        enc = handler.encrypt_file(b"content", STRONG_PASSWORD)
+        (workdir / "in.txt.gun101").write_bytes(enc)
+
+        def mock_decrypt_interrupt(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(handler, "decrypt_stream", mock_decrypt_interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            cli.decrypt(make_arg(file="in.txt.gun101", keyfile=None, output="out.txt", force=False))
+
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+        assert not (workdir / "out.txt").exists()
+
+    def test_decrypt_keyboard_interrupt_preserves_existing_destination_with_force(
+        self, workdir, env_password, monkeypatch
+    ):
+        """KeyboardInterrupt with force=True must not delete the existing destination file."""
+        enc = handler.encrypt_file(b"content", STRONG_PASSWORD)
+        (workdir / "in.txt.gun101").write_bytes(enc)
+        existing_dest = workdir / "out.txt"
+        existing_dest.write_bytes(b"PRESERVE THIS EXISTING CONTENT")
+
+        def mock_decrypt_interrupt(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(handler, "decrypt_stream", mock_decrypt_interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            cli.decrypt(make_arg(file="in.txt.gun101", keyfile=None, output="out.txt", force=True))
+
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+        assert existing_dest.exists()
+        assert existing_dest.read_bytes() == b"PRESERVE THIS EXISTING CONTENT"
+
+    def test_encrypt_keyboard_interrupt_after_replace_preserves_published_output(
+        self, workdir, env_password, monkeypatch
+    ):
+        """KeyboardInterrupt immediately after os.replace() must not delete the published output."""
+        (workdir / "in.txt").write_bytes(b"important payload")
+
+        real_publish = cli._publish_staging_file
+
+        def publish_and_interrupt(src, dst, force=False):
+            real_publish(src, dst, force=force)
+            raise KeyboardInterrupt("simulated interrupt after replace")
+
+        monkeypatch.setattr(cli, "_publish_staging_file", publish_and_interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            cli.encrypt(make_arg(file="in.txt", keyfile=None, output="out.gun101", force=False))
+
+        # Staging file is gone
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+        # Published file exists and has non-zero size
+        out_file = workdir / "out.gun101"
+        assert out_file.exists()
+        assert out_file.stat().st_size > 0
+
+    def test_decrypt_keyboard_interrupt_after_replace_preserves_published_output(
+        self, workdir, env_password, monkeypatch
+    ):
+        """KeyboardInterrupt immediately after os.replace() in decrypt() must not delete published output."""
+        payload = b"top secret decrypted payload"
+        enc = handler.encrypt_file(payload, STRONG_PASSWORD)
+        (workdir / "in.txt.gun101").write_bytes(enc)
+
+        real_publish = cli._publish_staging_file
+
+        def publish_and_interrupt(src, dst, force=False):
+            real_publish(src, dst, force=force)
+            raise KeyboardInterrupt("simulated interrupt after replace")
+
+        monkeypatch.setattr(cli, "_publish_staging_file", publish_and_interrupt)
+
+        with pytest.raises(KeyboardInterrupt):
+            cli.decrypt(make_arg(file="in.txt.gun101", keyfile=None, output="out.txt", force=False))
+
+        # Staging file is gone
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+        # Published file exists and contains exact plaintext
+        out_file = workdir / "out.txt"
+        assert out_file.exists()
+        assert out_file.read_bytes() == payload
+
+    def test_encrypt_cleanup_preserves_destination_replaced_during_failure(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Cleanup must never delete a destination file replaced by another process."""
+        (workdir / "in.txt").write_bytes(b"payload")
+        victim_file = workdir / "out.gun101"
+
+        def publish_and_fail(src, dst, force=False):
+            # Another process creates/replaces destination before cleanup
+            victim_file.write_bytes(b"VICTIM DATA DO NOT DELETE")
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr(cli, "_publish_staging_file", publish_and_fail)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="out.gun101", force=False)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "simulated rename failure" in err
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+        assert victim_file.exists()
+        assert victim_file.read_bytes() == b"VICTIM DATA DO NOT DELETE"
+
+    def test_decrypt_cleanup_preserves_destination_replaced_during_failure(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Decrypt cleanup must never delete a destination file replaced by another process."""
+        enc = handler.encrypt_file(b"payload", STRONG_PASSWORD)
+        (workdir / "in.txt.gun101").write_bytes(enc)
+        victim_file = workdir / "out.txt"
+
+        def publish_and_fail(src, dst, force=False):
+            # Another process creates/replaces destination before cleanup
+            victim_file.write_bytes(b"CRITICAL VICTIM DATA")
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr(cli, "_publish_staging_file", publish_and_fail)
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="in.txt.gun101", keyfile=None, output="out.txt", force=False)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "simulated rename failure" in err
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+        assert victim_file.exists()
+        assert victim_file.read_bytes() == b"CRITICAL VICTIM DATA"
+
+    def test_encrypt_concurrent_destination_creation_not_overwritten(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Destination created concurrently between validation and publication must not be overwritten."""
+        (workdir / "in.txt").write_bytes(b"plaintext payload to encrypt")
+        target_out = workdir / "out.gun101"
+
+        real_publish = cli._publish_staging_file
+
+        def raced_publish(staging_path, output_path, force=False):
+            # Simulate a concurrent process creating the target right before publication
+            target_out.write_bytes(b"CONCURRENT PROCESS CONTENT - DO NOT CLOBBER")
+            return real_publish(staging_path, output_path, force=force)
+
+        monkeypatch.setattr(cli, "_publish_staging_file", raced_publish)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="out.gun101", force=False)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "already exists" in err
+        # The concurrently created file must be preserved completely untouched
+        assert target_out.exists()
+        assert target_out.read_bytes() == b"CONCURRENT PROCESS CONTENT - DO NOT CLOBBER"
+        # Staging file was cleaned up
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+
+    def test_decrypt_concurrent_destination_creation_not_overwritten(
+        self, workdir, env_password, monkeypatch
+    ):
+        """Decryption destination created concurrently between validation and publication must not be overwritten."""
+        enc = handler.encrypt_file(b"secret plaintext", STRONG_PASSWORD)
+        (workdir / "in.txt.gun101").write_bytes(enc)
+        target_out = workdir / "out.txt"
+
+        real_publish = cli._publish_staging_file
+
+        def raced_publish(staging_path, output_path, force=False):
+            # Simulate a concurrent process creating the target right before publication
+            target_out.write_bytes(b"CONCURRENT VICTIM PLAINTEXT - DO NOT CLOBBER")
+            return real_publish(staging_path, output_path, force=force)
+
+        monkeypatch.setattr(cli, "_publish_staging_file", raced_publish)
+
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="in.txt.gun101", keyfile=None, output="out.txt", force=False)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "already exists" in err
+        # The concurrently created file must be preserved completely untouched
+        assert target_out.exists()
+        assert target_out.read_bytes() == b"CONCURRENT VICTIM PLAINTEXT - DO NOT CLOBBER"
+        # Staging file was cleaned up
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+
+    def test_encrypt_concurrent_destination_creation_overwritten_with_force(
+        self, workdir, env_password, monkeypatch
+    ):
+        """With force=True, publication succeeds and replaces a concurrently created destination."""
+        (workdir / "in.txt").write_bytes(b"force overwrite payload")
+        target_out = workdir / "out.gun101"
+
+        real_publish = cli._publish_staging_file
+
+        def raced_publish(staging_path, output_path, force=False):
+            target_out.write_bytes(b"OLD CONTENT TO BE OVERWRITTEN")
+            return real_publish(staging_path, output_path, force=force)
+
+        monkeypatch.setattr(cli, "_publish_staging_file", raced_publish)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="out.gun101", force=True)
+        )
+
+        assert exc is None
+        assert target_out.exists()
+        assert target_out.read_bytes() != b"OLD CONTENT TO BE OVERWRITTEN"
+        # Verify content is valid ciphertext that decrypts to original
+        dec = handler.decrypt_file(target_out.read_bytes(), STRONG_PASSWORD)
+        assert dec == b"force overwrite payload"
+
+    @pytest.mark.parametrize("err_num", UNSUPPORTED_HARDLINK_ERRNOS)
+    def test_posix_unsupported_hardlink_fails_safely_without_replace_fallback(
+        self, workdir, env_password, monkeypatch, err_num
+    ):
+        """When hard links are unsupported on POSIX, publish must fail without falling back to os.replace()."""
+        (workdir / "in.txt").write_bytes(b"content")
+        target_out = workdir / "out.gun101"
+
+        # Simulate POSIX
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        replace_called = []
+        real_replace = os.replace
+
+        def spy_replace(src, dst):
+            replace_called.append((src, dst))
+            return real_replace(src, dst)
+
+        def mock_link_unsupported(src, dst):
+            # Simulate a concurrent process creating the target during link attempt
+            target_out.write_bytes(b"EXISTING USER DATA")
+            raise OSError(err_num, "Unsupported filesystem link")
+
+        monkeypatch.setattr(os, "link", mock_link_unsupported)
+        monkeypatch.setattr(os, "replace", spy_replace)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="out.gun101", force=False)
+        )
+
+        assert exc is not None and exc.code == 1
+        assert "hard links are unsupported or prohibited" in err
+        # Crucially: os.replace must NOT have been called to clobber destination without --force
+        assert not replace_called
+        assert target_out.read_bytes() == b"EXISTING USER DATA"
+        assert not [p.name for p in workdir.iterdir() if ".tmp." in p.name]
+
+    def test_posix_staging_unlink_failure_after_successful_link_preserves_published_output(
+        self, workdir, env_password, monkeypatch
+    ):
+        """If os.link succeeds but unlinking the staging link fails, publication succeeds and output is kept."""
+        (workdir / "in.txt").write_bytes(b"content to encrypt")
+        target_out = workdir / "out.gun101"
+
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        real_unlink = os.unlink
+
+        def mock_link(src, dst):
+            with open(src, "rb") as s, open(dst, "wb") as d:
+                d.write(s.read())
+
+        def mock_unlink(path):
+            if ".tmp." in str(path):
+                raise OSError("simulated staging unlink failure")
+            return real_unlink(path)
+
+        monkeypatch.setattr(os, "link", mock_link)
+        monkeypatch.setattr(os, "unlink", mock_unlink)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="out.gun101", force=False)
+        )
+
+        assert exc is None
+        assert "Encrypted file written to: out.gun101" in out
+        assert target_out.exists()
+        dec = handler.decrypt_file(target_out.read_bytes(), STRONG_PASSWORD)
+        assert dec == b"content to encrypt"
+
+        # Also verify decrypt succeeds when staging unlink fails after linking
+        plain_out = workdir / "decrypted.txt"
+        out, err, exc = run_func(
+            cli.decrypt, make_arg(file="out.gun101", keyfile=None, output="decrypted.txt", force=False)
+        )
+        assert exc is None
+        assert "Decrypted file written to: decrypted.txt" in out
+        assert plain_out.exists()
+        assert plain_out.read_bytes() == b"content to encrypt"
+
+    def test_posix_unsupported_hardlink_with_force_uses_replace(
+        self, workdir, env_password, monkeypatch
+    ):
+        """With force=True on POSIX, publication bypasses hard links and uses os.replace() directly."""
+        (workdir / "in.txt").write_bytes(b"force payload")
+        target_out = workdir / "out.gun101"
+        target_out.write_bytes(b"OLD CONTENT")
+
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        def mock_link_unsupported(src, dst):
+            pytest.fail("os.link should not be called when force=True")
+
+        monkeypatch.setattr(os, "link", mock_link_unsupported)
+
+        out, err, exc = run_func(
+            cli.encrypt, make_arg(file="in.txt", keyfile=None, output="out.gun101", force=True)
+        )
+
+        assert exc is None
+        assert target_out.exists()
+        assert target_out.read_bytes() != b"OLD CONTENT"
+        dec = handler.decrypt_file(target_out.read_bytes(), STRONG_PASSWORD)
+        assert dec == b"force payload"
