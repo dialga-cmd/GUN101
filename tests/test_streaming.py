@@ -310,6 +310,35 @@ class TestHandlerStreaming:
         with pytest.raises(ValueError, match="Decryption failed"):
             handler.decrypt_stream(io.BytesIO(tampered), io.BytesIO(), STRONG_PASSWORD)
 
+    def test_stream_rejects_trailing_metadata(self):
+        """Fields after ciphertext are unauthenticated and must be rejected (issue #41)."""
+        enc_stream = io.BytesIO()
+        handler.encrypt_stream(io.BytesIO(b"stream secret"), enc_stream, STRONG_PASSWORD)
+        raw = enc_stream.getvalue()
+        tag_marker = b', "tag": "'
+
+        # Unknown field appended after the canonical trailing tag.
+        after_tag = raw[:-1] + b', "injected_after_tag": "yes"}'
+        # Unknown field inserted between ciphertext and tag.
+        tag_idx = raw.index(tag_marker)
+        before_tag = raw[:tag_idx] + b', "injected_before_tag": "yes"' + raw[tag_idx:]
+        # Duplicate tag field.
+        duplicate_tag = raw[:tag_idx] + b', "tag": "' + b"A" * 24 + b'"' + raw[tag_idx:]
+
+        for tampered in (after_tag, before_tag, duplicate_tag):
+            with pytest.raises(ValueError, match="Decryption failed"):
+                handler.decrypt_stream(io.BytesIO(tampered), io.BytesIO(), STRONG_PASSWORD)
+        # json.loads keeps the last duplicate key, so the one-shot path sees the
+        # original container for the duplicate-tag case and still succeeds.
+        for tampered in (after_tag, before_tag):
+            with pytest.raises(ValueError, match="Decryption failed"):
+                handler.decrypt_file(tampered, STRONG_PASSWORD)
+
+        # The canonical container remains valid.
+        out = io.BytesIO()
+        handler.decrypt_stream(io.BytesIO(raw), out, STRONG_PASSWORD)
+        assert out.getvalue() == b"stream secret"
+
     def test_stream_missing_fields_fails(self):
         valid = {
             "protocol": config.PROTOCOL,
