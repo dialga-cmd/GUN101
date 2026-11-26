@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gun101"
-version = "2.2.2"
+version = "2.2.3"
 description = "A simple, secure file encryption tool using AES-256-GCM and Argon2id"
 readme = "README.md"
 requires-python = ">=3.10"

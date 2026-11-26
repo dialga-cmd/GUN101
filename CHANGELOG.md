@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] - 2026-11-26
+
+### Fixed
+
+- **Streaming decrypt rejects unauthenticated trailing metadata.** Fields after
+  `ciphertext` other than the canonical `tag` were parsed but never covered by
+  the AES-GCM associated data, so `decrypt_stream()` accepted containers that
+  `decrypt_file()` rejected. They are now rejected with the generic
+  `Decryption failed` error (#41).
+- **Truncated streaming ciphertext no longer hangs the parser.** A container
+  ending inside the base64 `ciphertext` with 1–3 characters buffered and no
+  closing quote caused an infinite loop at 100% CPU. EOF now fails fast (#60).
+- **`safe_open_write()` cleans up its placeholder on validation failure.** A
+  failed post-open check left a zero-byte file at the destination, blocking
+  retries. The newly created file is now unlinked, with an inode check to avoid
+  deleting a concurrent replacement (#56).
+
 ## [2.2.2] - 2026-10-22
 
 ### Fixed
