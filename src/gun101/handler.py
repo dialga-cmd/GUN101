@@ -389,6 +389,14 @@ class StreamingContainerReader:
                                 v = self._parse_string()
                             else:
                                 v = self._parse_primitive()
+                            # The canonical container ends with the single `tag`
+                            # field. The v2.1 AAD is built from metadata parsed
+                            # before the ciphertext, so any other trailing field
+                            # would be unauthenticated. Reject it instead of
+                            # silently accepting (and potentially consuming)
+                            # data that decrypt_file() would reject.
+                            if k != "tag" or k in metadata:
+                                raise ValueError("Decryption failed")
                             metadata[k] = v
                         else:
                             raise ValueError("Decryption failed")
@@ -538,8 +546,8 @@ def decrypt_stream(
         Metadata fields must precede the ``ciphertext`` field, which is the
         canonical layout produced by :func:`encrypt_stream`. The associated
         data used for v2.1 authentication is reconstructed from the metadata
-        parsed before the ciphertext, so fields placed after it would not be
-        covered and authentication would fail (fail-closed).
+        parsed before the ciphertext, so any field following the ciphertext
+        other than the canonical ``tag`` is rejected (fail-closed).
     """
     reader = StreamingContainerReader(in_stream, chunk_size=chunk_size)
     meta, ct_gen, finish_meta, saw_ciphertext = reader.read_metadata_and_ciphertext_chunks()
