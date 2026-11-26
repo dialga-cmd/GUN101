@@ -349,6 +349,12 @@ class StreamingContainerReader:
                             data_len = len(self.buf)
                             if data_len < 4:
                                 self._fill_buf(data_len + 1)
+                                # EOF can arrive with 1-3 base64 characters still
+                                # buffered. Without a closing quote the container
+                                # is truncated: fail instead of spinning forever
+                                # on a buffer that can no longer grow.
+                                if self.eof and len(self.buf) == data_len:
+                                    raise ValueError("Decryption failed")
                                 continue
                             take_len = data_len - (data_len % 4)
                             chunk_data = self.buf[:take_len]
