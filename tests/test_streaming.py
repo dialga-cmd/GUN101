@@ -339,6 +339,40 @@ class TestHandlerStreaming:
         handler.decrypt_stream(io.BytesIO(raw), out, STRONG_PASSWORD)
         assert out.getvalue() == b"stream secret"
 
+    def test_stream_truncated_ciphertext_fails_at_eof(self, monkeypatch):
+        """EOF inside the base64 ciphertext must fail, not loop forever (issue #60)."""
+        enc_stream = io.BytesIO()
+        handler.encrypt_stream(io.BytesIO(b"hello world"), enc_stream, STRONG_PASSWORD)
+        raw = enc_stream.getvalue()
+        marker = b', "ciphertext": "'
+        prefix = raw[: raw.index(marker) + len(marker)]
+
+        class _ParserWatchdog(BaseException):
+            """Escape the parser's broad `except Exception` so a loop fails the test."""
+
+        original_fill = handler.StreamingContainerReader._fill_buf
+        calls = 0
+
+        def guarded_fill(self, min_bytes=1):
+            nonlocal calls
+            calls += 1
+            if calls > 2000:
+                raise _ParserWatchdog("parser did not terminate")
+            original_fill(self, min_bytes)
+
+        monkeypatch.setattr(handler.StreamingContainerReader, "_fill_buf", guarded_fill)
+
+        for tail in (b"A", b"AA", b"AAA", b"AAAAA"):
+            calls = 0
+            with pytest.raises(ValueError, match="Decryption failed"):
+                handler.decrypt_stream(io.BytesIO(prefix + tail), io.BytesIO(), STRONG_PASSWORD)
+
+        # A complete container is unaffected.
+        calls = 0
+        out = io.BytesIO()
+        handler.decrypt_stream(io.BytesIO(raw), out, STRONG_PASSWORD)
+        assert out.getvalue() == b"hello world"
+
     def test_stream_missing_fields_fails(self):
         valid = {
             "protocol": config.PROTOCOL,
