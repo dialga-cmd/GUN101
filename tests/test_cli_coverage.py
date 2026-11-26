@@ -368,6 +368,23 @@ class TestSafeOpenWritePathContainment:
         assert cli.safe_open_write is _util.safe_open_write
         assert keyfile.safe_open_write is _util.safe_open_write
 
+    def test_post_open_validation_failure_removes_placeholder(self, workdir, monkeypatch):
+        """A failed post-open validation must not leave an empty file behind (issue #56)."""
+
+        def boom(*args, **kwargs):
+            raise ValueError("simulated post-open validation failure")
+
+        with monkeypatch.context() as m:
+            m.setattr(_util, "_validate_open_file", boom)
+            with pytest.raises(ValueError, match="simulated"):
+                _util.safe_open_write("placeholder.bin")
+        assert not os.path.exists("placeholder.bin")
+
+        # The destination is usable again after the failure.
+        with _util.safe_open_write("placeholder.bin") as f:
+            f.write(b"ok")
+        assert open("placeholder.bin", "rb").read() == b"ok"
+
     def test_safe_open_write_relative_path(self, workdir):
         """Relative paths within cwd should be accepted."""
         with cli.safe_open_write("relative.bin") as f:
