@@ -161,9 +161,20 @@ def safe_open_write(path, force=False):
 
     # Reached only via the `break` above: the file was created with O_EXCL,
     # so no pre-existing inode needs to be compared against.
+    opened_stat = os.fstat(fd)
     try:
         _validate_open_file(fd, path)
         return os.fdopen(fd, "wb")
     except Exception:
         os.close(fd)
+        # The file was created by this call. Remove it so a failed validation
+        # cannot leave an empty placeholder that blocks a subsequent retry.
+        # Only unlink when the path still names the inode we created, so a
+        # concurrent replacement cannot make us delete somebody else's file.
+        try:
+            current_stat = os.lstat(path)
+            if stat.S_ISREG(current_stat.st_mode) and _same_file(current_stat, opened_stat):
+                os.unlink(path)
+        except OSError:
+            pass
         raise
